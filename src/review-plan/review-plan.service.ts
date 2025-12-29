@@ -1,0 +1,1103 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import PDFDocument from 'pdfkit';
+import SVGtoPDF from 'svg-to-pdfkit';
+import { validate as validateEmail } from '@mailtester/core';
+import * as postmark from 'postmark';
+import OpenAI from 'openai';
+import type {
+  ReviewPlanRequest,
+  ReviewPlanSelections,
+} from './review-plan.types';
+
+/* eslint-disable
+  @typescript-eslint/no-unsafe-assignment,
+  @typescript-eslint/no-unsafe-call,
+  @typescript-eslint/no-unsafe-member-access
+*/
+
+type AssessResult = { status: 'pass' | 'fail' | 'incomplete'; message: string };
+
+type GptListing = {
+  condo: string;
+  bedrooms: number[];
+  price_lower: string;
+  price_higher: string;
+  size_lower: string;
+  size_higher: string;
+  listings: Array<{
+    bedrooms: number;
+    price: string;
+    size: string;
+    url: string;
+  }>;
+};
+
+type CashCpf = { cash: number; cpf: number };
+type CostBreakdown = {
+  price: number;
+  downpaymentTotal: number;
+  loanTenure: number;
+  loanRatio: number;
+  maxLoan: number;
+  minCashDown: number;
+  bsd: number;
+  bsdRate: number;
+  legalFees: number;
+  miscFees: number;
+  totalUpfront: number;
+  cpfUsed: number;
+  cashReqAfterCPF: number;
+  cpfRemaining: number;
+  cashRemaining: number;
+  cashShortfall: number; // >0 means insufficient cash
+};
+
+const STRESS_RATE = 0.045 / 12; // 4.5% annual, monthly
+const REF_TENURE_MONTHS = 30 * 12;
+
+function calculateLoanRatio(months: number): number {
+  if (months >= REF_TENURE_MONTHS) return 1;
+  const num = 1 - Math.pow(1 + STRESS_RATE, -months);
+  const den = 1 - Math.pow(1 + STRESS_RATE, -REF_TENURE_MONTHS);
+  return num / den;
+}
+
+function getAgeFromRange(ageRange: string): number {
+  switch (ageRange) {
+    case 'age1':
+      return 25; // <30
+    case 'age2':
+      return 32; // 30-34
+    case 'age3':
+      return 37; // 35-39
+    case 'age4':
+      return 45; // 40+
+    default:
+      return 35;
+  }
+}
+
+const labelMaps = {
+  buyerType: {
+    single: 'Single',
+    couple: 'Couple',
+    mixed: 'Mixed-nationality household',
+  },
+  ageRange: { age1: '<30', age2: '30–34', age3: '35–39', age4: '40+' },
+  yesNo: { yes: 'Yes', no: 'No', unsure: 'Not sure' },
+  cashRange: { c1: '<$150k', c2: '$150–250k', c3: '$250–400k', c4: '$400k+' },
+  cpfRange: { cpf1: '<$50k', cpf2: '$50–150k', cpf3: '$150k+' },
+  bufferRange: { b1: '<3', b2: '3–6', b3: '6–12', b4: '12+' },
+  priceRange: { p1: '<$1.2m', p2: '$1.2–1.6m', p3: '$1.6–2.0m', p4: '$2.0m+' },
+  locationPref: { ocr: 'OCR', rcr: 'RCR', ccr: 'CCR', flexible: 'Flexible' },
+  launchType: { new: 'New', resale: 'Resale', open: 'Open' },
+  holdingPeriod: { h1: '<3 yrs', h2: '3–5 yrs', h3: '5–10 yrs', h4: '10+ yrs' },
+  exitOption: {
+    upgrade: 'Sell to upgrade',
+    hold: 'Hold long-term',
+    rent: 'Rent out',
+    unsure: 'Unsure',
+  },
+  targetBuyer: {
+    investor: 'Investor',
+    hdb: 'HDB upgrader',
+    owner: 'Another owner-occupier',
+    unsure: 'Unsure',
+  },
+  stability: { vstable: 'Very stable', stable: 'Stable', variable: 'Variable' },
+} as const;
+
+function mapLabel(map: Record<string, string>, key: string) {
+  return map[key] ?? key ?? '';
+}
+
+function money(n: number) {
+  const rounded = Math.round(n);
+  return `S$${rounded.toLocaleString('en-SG')}`;
+}
+
+function parseLowerBoundFromRangeLabel(label: string): number {
+  // Examples: "<$150k", "$150–250k", "$250–400k", "$400k+"
+  const cleaned = label.replace(/[,\s]/g, '');
+  const m = cleaned.match(/\$([0-9]+(?:\.[0-9]+)?)m/i);
+  if (m) return Number(m[1]) * 1_000_000;
+  const k = cleaned.match(/\$([0-9]+)k/i);
+  if (k) return Number(k[1]) * 1_000;
+  const plain = cleaned.match(/\$([0-9]+)/);
+  if (plain) return Number(plain[1]);
+  return 0;
+}
+
+function cashCpfFromSelections(selections: ReviewPlanSelections): CashCpf {
+  const cashLabel = mapLabel(
+    labelMaps.cashRange as unknown as Record<string, string>,
+    selections.cashRange,
+  );
+  const cpfLabel = mapLabel(
+    labelMaps.cpfRange as unknown as Record<string, string>,
+    selections.cpfRange,
+  );
+  return {
+    cash: parseLowerBoundFromRangeLabel(cashLabel),
+    cpf: parseLowerBoundFromRangeLabel(cpfLabel),
+  };
+}
+
+function pricePointsForRange(priceRange: string): number[] {
+  // As requested:
+  // p1 (<$1.2m) -> [1.2m]
+  // p2 ($1.2–1.6m) -> [1.2m, 1.6m]
+  // p3 ($1.6–2.0m) -> [1.6m, 2.0m]
+  // p4 ($2.0m+) -> [2.0m]
+  switch (priceRange) {
+    case 'p1':
+      return [1_200_000];
+    case 'p2':
+      return [1_200_000, 1_600_000];
+    case 'p3':
+      return [1_600_000, 2_000_000];
+    case 'p4':
+      return [2_000_000];
+    default:
+      return [];
+  }
+}
+
+function computeBsd(price: number) {
+  // Singapore BSD (residential) tiers (commonly used):
+  // 1% first 180k, 2% next 180k, 3% next 640k, 4% next 500k, 5% next 1.5m, 6% remaining.
+  // NOTE: This is an estimate and may not include ABSD or any future changes.
+  const tiers: Array<[number, number]> = [
+    [180_000, 0.01],
+    [180_000, 0.02],
+    [640_000, 0.03],
+    [500_000, 0.04],
+    [1_500_000, 0.05],
+    [Number.POSITIVE_INFINITY, 0.06],
+  ];
+  let remaining = price;
+  let tax = 0;
+  for (const [cap, rate] of tiers) {
+    const chunk = Math.min(remaining, cap);
+    if (chunk <= 0) break;
+    tax += chunk * rate;
+    remaining -= chunk;
+  }
+  return tax;
+}
+
+function computeUpfront({
+  price,
+  cash,
+  cpf,
+  ageRange,
+}: {
+  price: number;
+  cash: number;
+  cpf: number;
+  ageRange: string;
+}): CostBreakdown {
+  const age = getAgeFromRange(ageRange);
+  const loanTenure = Math.min(30, Math.max(0, 65 - age));
+  const loanRatio = calculateLoanRatio(loanTenure * 12);
+  const maxLoan = price * 0.75 * loanRatio;
+
+  const downpaymentTotal = price - maxLoan;
+  const minCashDown = price * 0.05;
+  const bsd = computeBsd(price);
+  const bsdRate = (bsd / price) * 100;
+  const legalFees = 3_000; // estimate
+  const miscFees = 2_000; // valuation/admin/incidentals estimate
+  const totalUpfront = downpaymentTotal + bsd + legalFees + miscFees;
+
+  // Allocation rule (to preserve cash where possible):
+  // - Use cash to satisfy mandatory 5% cash
+  // - Use CPF for remaining upfront (downpayment+BSD+fees) as available
+  // - Remaining comes from cash
+  const cashMin = Math.min(cash, minCashDown);
+  let remaining = totalUpfront - cashMin;
+  const cpfUsed = Math.min(cpf, remaining);
+  remaining -= cpfUsed;
+  const cashReqAfterCPF = cashMin + Math.max(0, remaining);
+
+  const cashRemaining = cash - cashReqAfterCPF;
+  const cpfRemaining = cpf - cpfUsed;
+  const cashShortfall = Math.max(0, -cashRemaining);
+
+  return {
+    price,
+    downpaymentTotal,
+    loanTenure,
+    loanRatio,
+    maxLoan,
+    minCashDown,
+    bsd,
+    bsdRate,
+    legalFees,
+    miscFees,
+    totalUpfront,
+    cpfUsed,
+    cashReqAfterCPF,
+    cpfRemaining,
+    cashRemaining: Math.max(0, cashRemaining),
+    cashShortfall,
+  };
+}
+
+function assess(
+  selections: ReviewPlanSelections,
+  funds: CashCpf,
+): AssessResult {
+  const { priceRange, cashRange, bufferRange } = selections;
+  if (!priceRange || !cashRange) {
+    return {
+      status: 'incomplete',
+      message: 'Incomplete: missing price range or cash range.',
+    };
+  }
+
+  const prices = pricePointsForRange(priceRange);
+  // We check if any of the target price points result in a shortfall
+  for (const p of prices) {
+    const b = computeUpfront({
+      price: p,
+      cash: funds.cash,
+      cpf: funds.cpf,
+      ageRange: selections.ageRange,
+    });
+    if (b.cashShortfall > 0) {
+      return {
+        status: 'fail',
+        message:
+          'Your declared capital and buffer are not sufficient for this price range. Revisit capital or target price.',
+      };
+    }
+  }
+
+  const priceIndex = ['p1', 'p2', 'p3', 'p4'].indexOf(priceRange);
+  const bufferIndex = ['b1', 'b2', 'b3', 'b4'].indexOf(bufferRange);
+
+  // Buffer check still applies
+  const bufferOk = bufferIndex >= 1 || priceIndex <= 1;
+
+  if (bufferOk) {
+    return {
+      status: 'pass',
+      message:
+        'Your declared capital and buffer look adequate for this price range.',
+    };
+  }
+
+  return {
+    status: 'fail',
+    message:
+      'Comfort buffer looks thin for this price range. Increase liquidity runway.',
+  };
+}
+
+async function renderPdf({
+  name,
+  email,
+  selections,
+  gptListings = [],
+}: {
+  name?: string;
+  email: string;
+  selections: ReviewPlanSelections;
+  gptListings?: GptListing[];
+}): Promise<Buffer> {
+  const doc = new PDFDocument({
+    size: 'A4',
+    margins: { top: 80, left: 48, right: 48, bottom: 84 }, // reserve space for header/footer
+  });
+
+  const chunks: Buffer[] = [];
+  const done = new Promise<Buffer>((resolve, reject) => {
+    doc.on('data', (d) => chunks.push(d as Buffer));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+
+  const logoPath = path.resolve(process.cwd(), 'assets/hart-logo.svg');
+  const logoSvg = await fs.readFile(logoPath, 'utf8');
+
+  const bottomLimit = () => doc.page.height - doc.page.margins.bottom;
+  const ensureSpace = (needed: number) => {
+    if (doc.y + needed > bottomLimit()) {
+      doc.addPage();
+    }
+  };
+
+  const drawHeader = () => {
+    const prevY = doc.y;
+    doc.save();
+
+    // White background
+    doc.rect(0, 0, doc.page.width, 60).fillColor('#FFFFFF').fill();
+
+    // Text in header - color changed to primary blue (#13305D)
+    // Using Courier-Bold to mimic JetBrains Mono from the website
+    doc
+      .font('Courier-Bold')
+      .fontSize(16)
+      .fillColor('#13305D')
+      .text('HART PROPERTY', 94, 23, { align: 'left' });
+
+    // Logo in header
+    doc.save();
+    SVGtoPDF(doc as unknown as never, logoSvg, 48, 12, {
+      width: 36,
+      preserveAspectRatio: 'xMinYMin meet',
+    });
+    doc.restore();
+
+    // Subtle bottom border to match the website's scaffolding line
+    doc
+      .moveTo(0, 60)
+      .lineTo(doc.page.width, 60)
+      .strokeColor('#3E5C8A')
+      .strokeOpacity(0.15)
+      .lineWidth(0.5)
+      .stroke();
+
+    doc.restore();
+    doc.y = prevY > 80 ? prevY : 80;
+  };
+
+  const drawFooter = () => {
+    const prevY = doc.y;
+    const prevMargins = { ...doc.page.margins };
+    doc.page.margins.bottom = 0;
+
+    const y = doc.page.height - 54;
+    doc
+      .save()
+      .font('Helvetica')
+      .fontSize(8.5)
+      .fillColor('#3E5C8A')
+      .text(
+        'HART PROPERTY • Michael Hart | CEA Registration: R071893C | Agency License: L3008022J',
+        48,
+        y,
+        { width: doc.page.width - 96, align: 'center' },
+      )
+      .restore();
+
+    doc.page.margins.bottom = prevMargins.bottom;
+    doc.y = prevY;
+  };
+
+  const drawTableRow = (
+    label: string,
+    value: string,
+    options: { isHeader?: boolean; isLast?: boolean } = {},
+  ) => {
+    const { isHeader = false, isLast = false } = options;
+    const startX = 48;
+    const col1Width = 250;
+    const col2Width = 250;
+    const rowHeight = 22;
+
+    ensureSpace(rowHeight);
+    const drawY = doc.y;
+
+    if (isHeader) {
+      doc
+        .save()
+        .rect(startX, drawY, col1Width + col2Width, rowHeight)
+        .fillColor('#F8FAFC')
+        .fill()
+        .restore();
+    }
+
+    doc
+      .font(isHeader ? 'Helvetica-Bold' : 'Helvetica')
+      .fontSize(10)
+      .fillColor(isHeader ? '#13305D' : '#3E5C8A')
+      .text(label, startX + 10, drawY + 6, { width: col1Width - 20 });
+
+    doc.fillColor('#1F2933').text(value, startX + col1Width + 10, drawY + 6, {
+      width: col2Width - 20,
+      align: 'right',
+    });
+
+    // Bottom border
+    if (!isLast) {
+      doc
+        .moveTo(startX, drawY + rowHeight)
+        .lineTo(startX + col1Width + col2Width, drawY + rowHeight)
+        .strokeColor('#E2E8F0')
+        .lineWidth(0.5)
+        .stroke();
+    }
+
+    doc.y = drawY + rowHeight;
+    doc.x = startX;
+  };
+
+  doc.on('pageAdded', () => {
+    drawHeader();
+    drawFooter();
+  });
+
+  // First page setup
+  drawHeader();
+  drawFooter();
+
+  // Title
+  doc.moveDown(0.5);
+  doc
+    .font('Helvetica-Bold')
+    .fontSize(20)
+    .fillColor('#13305D')
+    .text('Buying Plan Memo', { align: 'left' });
+
+  doc
+    .font('Helvetica')
+    .fontSize(10)
+    .fillColor('#3E5C8A')
+    .text(
+      `Generated: ${new Date().toLocaleString('en-SG', { timeZone: 'Asia/Singapore' })}`,
+      { align: 'left' },
+    );
+
+  doc.moveDown(1.5);
+  doc
+    .font('Helvetica-Bold')
+    .fontSize(12)
+    .fillColor('#13305D')
+    .text('Client Information', { align: 'left' });
+
+  doc.moveDown(0.5);
+  doc
+    .font('Helvetica')
+    .fontSize(10)
+    .fillColor('#1F2933')
+    .text(`Name: ${name?.trim() ? name.trim() : '-'}`, { align: 'left' })
+    .text(`Email: ${email}`, { align: 'left' });
+
+  // Selections
+  doc.moveDown(1.5);
+  doc
+    .font('Helvetica-Bold')
+    .fontSize(12)
+    .fillColor('#13305D')
+    .text('Your Selections', { align: 'left' });
+  doc.moveDown(0.5);
+
+  const selectionRows: Array<[string, string]> = [
+    ['Buyer type', mapLabel(labelMaps.buyerType, selections.buyerType)],
+    ['Age range', mapLabel(labelMaps.ageRange, selections.ageRange)],
+    [
+      'First private purchase',
+      mapLabel(labelMaps.yesNo, selections.isFirstPurchase),
+    ],
+    [
+      'Cash (downpayment + fees)',
+      mapLabel(labelMaps.cashRange, selections.cashRange),
+    ],
+    ['CPF OA', mapLabel(labelMaps.cpfRange, selections.cpfRange)],
+    [
+      'Buffer (months)',
+      mapLabel(labelMaps.bufferRange, selections.bufferRange),
+    ],
+    ['Target price', mapLabel(labelMaps.priceRange, selections.priceRange)],
+    ['Location', mapLabel(labelMaps.locationPref, selections.locationPref)],
+    ['New/resale', mapLabel(labelMaps.launchType, selections.launchType)],
+    [
+      'Good decision if flat 5y',
+      mapLabel(labelMaps.yesNo, selections.isGoodDecision),
+    ],
+    [
+      'Holding period',
+      mapLabel(labelMaps.holdingPeriod, selections.holdingPeriod),
+    ],
+    ['Likely exit', mapLabel(labelMaps.exitOption, selections.exitOption)],
+    [
+      'Expected buyer at exit',
+      mapLabel(labelMaps.targetBuyer, selections.targetBuyer),
+    ],
+    ['Income stability', mapLabel(labelMaps.stability, selections.stability)],
+  ];
+
+  for (let i = 0; i < selectionRows.length; i++) {
+    const [k, v] = selectionRows[i];
+    drawTableRow(k, v || '-', { isLast: i === selectionRows.length - 1 });
+  }
+
+  // Market stats
+  if (growthRegions.includes(selections.locationPref)) {
+    const region = selections.locationPref as keyof typeof growth;
+    doc.moveDown(1.5);
+    doc
+      .font('Helvetica-Bold')
+      .fontSize(12)
+      .fillColor('#13305D')
+      .text('Market Context', { align: 'left' });
+
+    doc.moveDown(0.5);
+    doc
+      .font('Helvetica')
+      .fontSize(10)
+      .fillColor('#3E5C8A')
+      .text(
+        'Non-landed private condos: Average annual PSF growth (2020–2023)',
+        { align: 'left' },
+      );
+
+    doc.moveDown(0.2);
+    doc
+      .font('Helvetica-Bold')
+      .fontSize(10)
+      .fillColor('#1F2933')
+      .text(
+        `${mapLabel(labelMaps.locationPref, region)} Region: ${growth[region]}`,
+        { align: 'left' },
+      );
+  }
+
+  // Capital breakdown
+  doc.moveDown(1.5);
+  doc
+    .font('Helvetica-Bold')
+    .fontSize(12)
+    .fillColor('#13305D')
+    .text('Client Capital', { align: 'left' });
+
+  doc.moveDown(0.3);
+  doc
+    .font('Helvetica')
+    .fontSize(9)
+    .fillColor('#3E5C8A')
+    .text(
+      'Assumptions: 25% downpayment (min 5% cash), excludes ABSD, legal/misc are estimates.',
+      { align: 'left' },
+    );
+
+  const funds = cashCpfFromSelections(selections);
+  doc.moveDown(0.5);
+
+  drawTableRow('Cash', money(funds.cash));
+  drawTableRow('CPF OA', money(funds.cpf), {
+    isLast: true,
+  });
+
+  const prices = pricePointsForRange(selections.priceRange);
+  for (const p of prices) {
+    doc.moveDown(1.2);
+    const b = computeUpfront({
+      price: p,
+      cash: funds.cash,
+      cpf: funds.cpf,
+      ageRange: selections.ageRange,
+    });
+
+    doc
+      .font('Helvetica-Bold')
+      .fontSize(11)
+      .fillColor('#13305D')
+      .text(`Capital Check: ${money(p)} Analysis`, { align: 'left' });
+
+    doc.moveDown(0.5);
+
+    const costLines: Array<[string, string]> = [
+      ['Item', 'Amount'],
+      [
+        `Downpayment (${((b.downpaymentTotal / p) * 100).toFixed(1)}%)`,
+        money(b.downpaymentTotal),
+      ],
+      [`Max Loan (${b.loanTenure} yrs @ 4.5% stress)`, money(b.maxLoan)],
+      [`Buyer’s Stamp Duty (BSD) (~${b.bsdRate.toFixed(1)}%)`, money(b.bsd)],
+      ['Legal fees (est.)', money(b.legalFees)],
+      ['Other fees (est.)', money(b.miscFees)],
+      ['Total upfront (est.)', money(b.totalUpfront)],
+      ['CPF used (est.)', money(b.cpfUsed)],
+      ['Cash Still Required', money(b.cashReqAfterCPF)],
+      [
+        'Cash remaining (est.)',
+        b.cashShortfall > 0
+          ? `Short by ${money(b.cashShortfall)}`
+          : money(b.cashRemaining),
+      ],
+    ];
+
+    for (let i = 0; i < costLines.length; i++) {
+      const [k, v] = costLines[i];
+      drawTableRow(k, v, {
+        isHeader: i === 0,
+        isLast: i === costLines.length - 1,
+      });
+    }
+  }
+
+  // Assessment
+  doc.moveDown(1.5);
+  const res = assess(selections, funds);
+  doc
+    .font('Helvetica-Bold')
+    .fontSize(12)
+    .fillColor('#13305D')
+    .text('Assessment', { align: 'left' });
+
+  doc.moveDown(0.5);
+  doc
+    .font('Helvetica')
+    .fontSize(11)
+    .fillColor(res.status === 'fail' ? '#B91C1C' : '#047857') // Stronger colors for status
+    .text(res.message, {
+      align: 'left',
+    });
+
+  // GPT Listings
+  if (gptListings && gptListings.length > 0) {
+    ensureSpace(120);
+    doc.moveDown(2);
+    doc
+      .font('Helvetica-Bold')
+      .fontSize(12)
+      .fillColor('#13305D')
+      .text('Based on your buyer profile these may suit you', {
+        align: 'left',
+      });
+
+    doc.moveDown(0.5);
+    doc
+      .font('Helvetica')
+      .fontSize(9)
+      .fillColor('#3E5C8A')
+      .text(
+        'Note: These listings are generated using AI and may not be accurate. Please verify the information independently before making any decision.',
+        { align: 'left' },
+      );
+
+    doc.moveDown(0.75);
+
+    for (const group of gptListings) {
+      ensureSpace(100);
+      doc
+        .font('Helvetica-Bold')
+        .fontSize(11)
+        .fillColor('#13305D')
+        .text(
+          `Development: ${group.condo} | Range: ${group.price_lower}–${group.price_higher} | Size: ${group.size_lower}–${group.size_higher}`,
+          { align: 'left' },
+        );
+
+      doc.moveDown(0.4);
+
+      for (let i = 0; i < group.listings.length; i++) {
+        const item = group.listings[i];
+        const isLast = i === group.listings.length - 1;
+        const rowText = `${item.bedrooms}BR | ${item.size} | ${item.price}`;
+
+        const startY = doc.y;
+        doc
+          .font('Helvetica')
+          .fontSize(10)
+          .fillColor('#1F2933')
+          .text(rowText, 58, startY);
+
+        // Keep link text ASCII to avoid glyph substitution artifacts in PDF renderers
+        const linkText = 'View listing';
+        const linkWidth = doc.widthOfString(linkText);
+        doc
+          .fillColor('#4C7DBF')
+          .text(linkText, doc.page.width - 48 - linkWidth, startY, {
+            link: item.url,
+            underline: true,
+          });
+
+        doc.moveDown(0.2);
+        if (!isLast) {
+          doc
+            .moveTo(58, doc.y)
+            .lineTo(doc.page.width - 48, doc.y)
+            .strokeColor('#E2E8F0')
+            .lineWidth(0.5)
+            .stroke();
+          doc.moveDown(0.2);
+        }
+      }
+      doc.moveDown(0.8);
+      doc.x = 48; // Reset x to left margin after each development block
+    }
+  }
+
+  // CTA
+  doc.moveDown(2);
+  doc.save();
+  doc
+    .rect(48, doc.y, doc.page.width - 96, 80)
+    .fillColor('#F1F5F9')
+    .fill();
+
+  doc.y += 15;
+  doc
+    .font('Helvetica-Bold')
+    .fontSize(12)
+    .fillColor('#13305D')
+    .text('Want a deeper analysis?', 60, undefined, {
+      align: 'left',
+    });
+
+  doc.moveDown(0.3);
+  doc
+    .font('Helvetica')
+    .fontSize(10)
+    .fillColor('#1F2933')
+    .text('WhatsApp: +65 9349 0577', 60, undefined, {
+      align: 'left',
+    })
+    .text('Email: michael.hart@hartproperty.sg', 60, undefined, {
+      align: 'left',
+    });
+  doc.restore();
+
+  doc.end();
+  return done;
+}
+
+const growth = {
+  ocr: '+11.5%',
+  rcr: '+5.8%',
+  ccr: '+3.5%',
+} as const;
+const growthRegions = Object.keys(growth);
+
+async function isValidPropertyGuruListingUrl(url: string): Promise<boolean> {
+  if (!url) return false;
+  // Only validate PropertyGuru URLs we expect to be navigable listing pages.
+  if (!/^https:\/\/www\.propertyguru\.com\.sg\//i.test(url)) return false;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7000);
+
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        // A basic UA helps avoid some bot blocks returning generic pages.
+        'user-agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+        accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+    });
+    if (!res.ok) return false;
+    const html = await res.text();
+
+    // Heuristics to distinguish a real listing page from a search results / generic page.
+    const hasAbout =
+      html.includes('<h2 class="title">About this property</h2>') ||
+      html.includes('hui-image hui-image--1_1 media-image images');
+    return hasAbout;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function validateGptListings(
+  listings: GptListing[],
+): Promise<GptListing[]> {
+  const cleaned = listings
+    .map((g) => ({
+      ...g,
+      condo: (g?.condo ?? '').trim(),
+      listings: Array.isArray(g?.listings) ? g.listings : [],
+    }))
+    .filter((g) => Boolean(g.condo) && g.listings.length > 0);
+
+  // Validate URLs and omit any that don't look like actual listing pages.
+  // Keep concurrency small to avoid hammering the target site.
+  const concurrency = 3;
+
+  async function worker(group: GptListing): Promise<GptListing | null> {
+    const items = group.listings;
+    const out: typeof items = [];
+
+    let i = 0;
+    while (i < items.length) {
+      const chunk = items.slice(i, i + concurrency);
+      const results = await Promise.all(
+        chunk.map(async (it) => ({
+          it,
+          ok: await isValidPropertyGuruListingUrl(it.url),
+        })),
+      );
+      for (const r of results) {
+        if (r.ok) out.push(r.it);
+      }
+      i += concurrency;
+    }
+
+    if (out.length === 0) return null;
+    return { ...group, listings: out };
+  }
+
+  const validated: GptListing[] = [];
+  for (const group of cleaned) {
+    // Intentionally sequential per development (with small concurrency per URL batch above)
+    // to avoid hammering the target site.
+    const v = await worker(group);
+    if (v) validated.push(v);
+  }
+
+  return validated;
+}
+
+async function fetchGptListings(
+  selections: ReviewPlanSelections,
+): Promise<GptListing[]> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return [];
+
+  const client = new OpenAI({ apiKey });
+  const priceLabel = mapLabel(
+    labelMaps.priceRange as unknown as Record<string, string>,
+    selections.priceRange,
+  );
+
+  const input = `can you search propertyguru for private condo sales in the range ${priceLabel}. find me listings from 3 condos. return listings in this JSON format with no other output, give me 3 listings per condo { condo: xxx, bedrooms: [2,3], price_lower: S$1.52M, price_higher: S$1.6M, size_lower: 600sqft, size_higher: 800 sqft, listings: [ { bedrooms: 2, price: $1.6M, size: 742sqft, url: https://xxxxx, ] } please make sure the URLs are to the actual listings and are navigatable, and not to the search results page. Return ONLY valid JSON array.`;
+
+  try {
+    // Using the user's specific GPT-5 / Search API snippet
+    // We use 'any' to bypass potential type mismatches if the SDK is not yet updated for this beta API
+    const response: any = await (client as any).responses.create({
+      model: 'gpt-5', // User specified gpt-5
+      tools: [{ type: 'web_search' }],
+      input,
+    });
+
+    console.log(
+      '[GPT Debug] Full API Response:',
+      JSON.stringify(response, null, 2),
+    );
+
+    // Based on the user's expected output format
+    const content =
+      response.output_text ||
+      response.output?.[0]?.content ||
+      response.choices?.[0]?.message?.content ||
+      response.text;
+
+    console.log('[GPT Debug] Extracted content:', content);
+
+    if (!content) return [];
+
+    let parsed: any;
+    if (typeof content === 'string') {
+      // The model might return markdown, so we strip it
+      const jsonStr = content.replace(/```json\n?|\n?```/g, '').trim();
+      parsed = JSON.parse(jsonStr);
+    } else {
+      // If content is already an object (e.g. from a structured output tool)
+      parsed = content;
+    }
+
+    let raw: GptListing[] = [];
+    if (Array.isArray(parsed)) {
+      raw = parsed as GptListing[];
+    } else if (parsed?.listings && Array.isArray(parsed.listings)) {
+      raw = parsed.listings as GptListing[];
+    }
+    if (raw.length === 0) return [];
+
+    console.log('[GPT Debug] Raw listings parsed:', raw.length);
+    const validated = await validateGptListings(raw);
+    console.log(
+      '[GPT Debug] Listings after URL validation:',
+      validated.reduce((acc, g) => acc + g.listings.length, 0),
+    );
+    return validated;
+  } catch (e) {
+    console.error('Error fetching GPT listings:', e);
+    // Fallback to empty if the beta API fails or is not available
+    return [];
+  }
+}
+
+export class ReviewPlanService {
+  async sendPlan(req: ReviewPlanRequest) {
+    const email = (req.email ?? '').trim().toLowerCase();
+    if (!email) {
+      return { ok: false, error: 'Email is required.' } as const;
+    }
+
+    console.log(`[ReviewPlan] Starting plan request for: ${email}`);
+
+    // Synchronous validation so UI knows if email is invalid
+    const validation = await validateEmail(email, {
+      preset: 'balanced',
+      earlyExit: true,
+      timeout: 3500,
+      validators: {
+        smtp: { enabled: false },
+      },
+    });
+
+    if (!validation.valid) {
+      console.log(`[ReviewPlan] Email validation failed for ${email}`);
+      const reason = validation.reason ?? 'invalid';
+      const suggestion = validation.validators.typo?.error?.suggestion;
+      return {
+        ok: false,
+        error: `Invalid email (${reason}).${suggestion ? ` Suggestion: ${suggestion}` : ''}`,
+      } as const;
+    }
+
+    // Start background job - don't await this
+    this.runBackgroundGeneration(req, email).catch((err) => {
+      console.error(
+        `[ReviewPlan] Critical error in background job for ${email}:`,
+        err,
+      );
+    });
+
+    console.log(
+      `[ReviewPlan] Request accepted, generation running in background for ${email}`,
+    );
+    return { ok: true, message: 'Plan generation started.' } as const;
+  }
+
+  private async runBackgroundGeneration(req: ReviewPlanRequest, email: string) {
+    const postmarkKey = process.env.POSTMARK_API_KEY;
+    const from = process.env.POSTMARK_FROM;
+
+    if (!postmarkKey || !from) {
+      throw new Error('Missing POSTMARK_API_KEY or POSTMARK_FROM');
+    }
+
+    console.log(`[ReviewPlan] [${email}] Step 1: Fetching GPT listings...`);
+    const gptListings = await fetchGptListings(req.selections);
+    console.log(
+      `[ReviewPlan] [${email}] Step 1: GPT listings fetched (${gptListings.length} found)`,
+    );
+
+    console.log(`[ReviewPlan] [${email}] Step 2: Generating PDF memo...`);
+    const pdf = await renderPdf({
+      name: req.name,
+      email,
+      selections: req.selections,
+      gptListings,
+    });
+    console.log(
+      `[ReviewPlan] [${email}] Step 2: PDF generated (${pdf.length} bytes)`,
+    );
+
+    console.log(
+      `[ReviewPlan] [${email}] Step 3: Sending email via Postmark...`,
+    );
+    const client = new postmark.ServerClient(postmarkKey);
+
+    const subject = 'Your buying plan memo (Hart Property)';
+    const logoUrl = process.env.PUBLIC_ASSETS_BASE_URL
+      ? `${process.env.PUBLIC_ASSETS_BASE_URL.replace(/\/$/, '')}/hart-logo.svg`
+      : 'https://hartproperty.sg/hart-logo.svg';
+
+    const selectionLines = [
+      `Buyer type: ${mapLabel(labelMaps.buyerType, req.selections.buyerType)}`,
+      `Age range: ${mapLabel(labelMaps.ageRange, req.selections.ageRange)}`,
+      `First private purchase: ${mapLabel(labelMaps.yesNo, req.selections.isFirstPurchase)}`,
+      `Cash: ${mapLabel(labelMaps.cashRange, req.selections.cashRange)}`,
+      `CPF OA: ${mapLabel(labelMaps.cpfRange, req.selections.cpfRange)}`,
+      `Buffer: ${mapLabel(labelMaps.bufferRange, req.selections.bufferRange)} months`,
+      `Target price: ${mapLabel(labelMaps.priceRange, req.selections.priceRange)}`,
+      `Location: ${mapLabel(labelMaps.locationPref, req.selections.locationPref)}`,
+      `New/resale: ${mapLabel(labelMaps.launchType, req.selections.launchType)}`,
+      `Holding period: ${mapLabel(labelMaps.holdingPeriod, req.selections.holdingPeriod)}`,
+      `Likely exit: ${mapLabel(labelMaps.exitOption, req.selections.exitOption)}`,
+    ].filter(Boolean);
+
+    const textBody =
+      `Here is your buying plan memo (PDF attached).\n\n` +
+      `Summary of your selections:\n- ${selectionLines.join('\n- ')}\n\n` +
+      `You received this because you requested a memo on hartproperty.sg.\n` +
+      `If this wasn’t you, reply to this email.\n\n` +
+      `Unsubscribe (stop receiving these emails): mailto:unsubscribe@hartproperty.sg?subject=unsubscribe\n`;
+
+    const htmlBody = `
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <title>${subject}</title>
+  </head>
+  <body style="margin:0;padding:0;background:#F7F6F3;">
+    <div style="max-width:640px;margin:0 auto;padding:24px;">
+      <div style="background:#ffffff;border:1px solid rgba(62,92,138,0.15);border-radius:14px;overflow:hidden;">
+        <div style="padding:22px 22px 14px 22px;border-bottom:1px solid rgba(62,92,138,0.15);">
+          <div style="display:flex;align-items:center;">
+            <img src="${logoUrl}" alt="Hart Property" width="44" height="44" style="display:block;margin-right:16px;" />
+            <div style="font-family:Inter,Arial,sans-serif;">
+              <div style="font-size:16px;font-weight:800;letter-spacing:-0.02em;color:#13305D;">HART PROPERTY</div>
+              <div style="font-size:12px;color:#3E5C8A;">Buying plan memo</div>
+            </div>
+          </div>
+        </div>
+
+        <div style="padding:22px;font-family:Inter,Arial,sans-serif;color:#1F2933;line-height:1.55;">
+          <div style="font-size:16px;font-weight:700;color:#13305D;margin-bottom:10px;">Your memo is attached (PDF)</div>
+          <div style="font-size:14px;color:#3E5C8A;margin-bottom:18px;">
+            Summary of your selections:
+          </div>
+
+          <ul style="margin:0 0 18px 18px;padding:0;font-size:14px;color:#1F2933;">
+            ${selectionLines.map((l) => `<li style="margin:6px 0;">${l}</li>`).join('')}
+          </ul>
+
+          <div style="font-size:13px;color:#3E5C8A;margin-top:8px;">
+            You received this because you requested a memo on
+            <a href="https://hartproperty.sg" style="color:#4C7DBF;text-decoration:none;">hartproperty.sg</a>.
+            If this wasn’t you, please reply to this email.
+          </div>
+        </div>
+
+        <div style="padding:16px 22px;border-top:1px solid rgba(62,92,138,0.15);font-family:JetBrains Mono,ui-monospace,Menlo,Monaco,Consolas,monospace;font-size:11px;line-height:1.6;color:#3E5C8A;">
+          <div>HART PROPERTY • Michael Hart | CEA Registration: R071893C | Agency License: L3008022J</div>
+          <div style="margin-top:6px;">
+            <a href="mailto:unsubscribe@hartproperty.sg?subject=unsubscribe" style="color:#4C7DBF;text-decoration:none;">Unsubscribe</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
+`.trim();
+
+    await client.sendEmail({
+      MessageStream: 'outbound',
+      From: `Hart Property <${from}>`,
+      To: email,
+      Bcc: 'michael.hart@hartproperty.sg',
+      ReplyTo: `Hart Property <${from}>`,
+      Subject: subject,
+      TextBody: textBody,
+      HtmlBody: htmlBody,
+      Headers: [
+        {
+          Name: 'List-Unsubscribe',
+          Value:
+            '<mailto:unsubscribe@hartproperty.sg?subject=unsubscribe>, <https://hartproperty.sg/unsubscribe>',
+        },
+        { Name: 'List-Unsubscribe-Post', Value: 'List-Unsubscribe=One-Click' },
+      ],
+      Attachments: [
+        {
+          Name: 'HartProperty-BuyingPlan.pdf',
+          Content: pdf.toString('base64'),
+          ContentType: 'application/pdf',
+          ContentID: null,
+        },
+      ],
+    });
+
+    console.log(`[ReviewPlan] [${email}] Step 3: Email sent successfully.`);
+    console.log(`[ReviewPlan] [${email}] Finished background generation job.`);
+  }
+}
