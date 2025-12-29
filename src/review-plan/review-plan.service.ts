@@ -5,6 +5,7 @@ import SVGtoPDF from 'svg-to-pdfkit';
 import { validate as validateEmail } from '@mailtester/core';
 import * as postmark from 'postmark';
 import OpenAI from 'openai';
+import cloudscraper from 'cloudscraper';
 import type {
   ReviewPlanRequest,
   ReviewPlanSelections,
@@ -106,6 +107,7 @@ const labelMaps = {
     unsure: 'Unsure',
   },
   stability: { vstable: 'Very stable', stable: 'Stable', variable: 'Variable' },
+  lifeChanges: { career: 'Career switch', kids: 'Kids', none: 'None' },
 } as const;
 
 function mapLabel(map: Record<string, string>, key: string) {
@@ -526,6 +528,15 @@ async function renderPdf({
       mapLabel(labelMaps.targetBuyer, selections.targetBuyer),
     ],
     ['Income stability', mapLabel(labelMaps.stability, selections.stability)],
+    [
+      'Planned life changes',
+      selections.lifeChanges
+        ? mapLabel(
+            labelMaps.lifeChanges as unknown as Record<string, string>,
+            String(selections.lifeChanges ?? ''),
+          )
+        : '-',
+    ],
   ];
 
   for (let i = 0; i < selectionRows.length; i++) {
@@ -773,38 +784,69 @@ const growth = {
 const growthRegions = Object.keys(growth);
 
 async function isValidPropertyGuruListingUrl(url: string): Promise<boolean> {
-  if (!url) return false;
+  console.log('[PG Validate] Start URL validation:', url);
+  if (!url) {
+    console.log('[PG Validate] ❌ Empty URL');
+    return false;
+  }
   // Only validate PropertyGuru URLs we expect to be navigable listing pages.
-  if (!/^https:\/\/www\.propertyguru\.com\.sg\//i.test(url)) return false;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 7000);
+  if (!/^https:\/\/www\.propertyguru\.com\.sg\//i.test(url)) {
+    console.log('[PG Validate] ❌ Not a propertyguru.com.sg URL');
+    return false;
+  }
 
   try {
-    const res = await fetch(url, {
-      method: 'GET',
-      redirect: 'follow',
-      signal: controller.signal,
+    // Cloudflare challenge pages can cause fetch() to return interstitial HTML.
+    // Use cloudscraper to solve challenges when possible.
+    const cs = cloudscraper as unknown as {
+      get: (opts: Record<string, unknown>) => Promise<string>;
+    };
+    const html = await cs.get({
+      uri: url,
+      timeout: 7000,
+      gzip: true,
       headers: {
         // A basic UA helps avoid some bot blocks returning generic pages.
-        'user-agent':
+        'User-Agent':
           'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
-        accept:
+        Accept:
           'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
     });
-    if (!res.ok) return false;
-    const html = await res.text();
 
     // Heuristics to distinguish a real listing page from a search results / generic page.
-    const hasAbout =
-      html.includes('<h2 class="title">About this property</h2>') ||
-      html.includes('hui-image hui-image--1_1 media-image images');
-    return hasAbout;
-  } catch {
+    console.log('[PG Validate] HTML length:', html.length);
+
+    // More tolerant matching than strict includes (PropertyGuru HTML varies / minifies).
+    const aboutRegex =
+      /<h2[^>]*class=["']title["'][^>]*>\s*About this property\s*<\/h2>/i;
+    const imageRegex =
+      /hui-image--1_1[\s\S]{0,120}media-image[\s\S]{0,120}images/i;
+
+    const hasAbout = aboutRegex.test(html);
+    const hasImage = imageRegex.test(html);
+
+    console.log('[PG Validate] Marker check:', {
+      hasAbout,
+      hasImage,
+      includesAboutLiteral: html.includes(
+        '<h2 class="title">About this property</h2>',
+      ),
+      includesImageLiteral: html.includes(
+        'hui-image hui-image--1_1 media-image images',
+      ),
+    });
+
+    const ok = hasAbout || hasImage;
+    console.log(
+      ok
+        ? '[PG Validate] ✅ Valid listing page'
+        : '[PG Validate] ❌ Missing markers',
+    );
+    return ok;
+  } catch (err) {
+    console.log('[PG Validate] ❌ Request failed (cloudscraper)', err);
     return false;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -824,6 +866,7 @@ async function validateGptListings(
   const concurrency = 3;
 
   async function worker(group: GptListing): Promise<GptListing | null> {
+    console.log('[PG Validate] Validating development:', group.condo);
     const items = group.listings;
     const out: typeof items = [];
 
@@ -837,6 +880,11 @@ async function validateGptListings(
         })),
       );
       for (const r of results) {
+        console.log('[PG Validate] URL result:', {
+          condo: group.condo,
+          url: r.it.url,
+          ok: r.ok,
+        });
         if (r.ok) out.push(r.it);
       }
       i += concurrency;
@@ -1019,6 +1067,14 @@ export class ReviewPlanService {
       `New/resale: ${mapLabel(labelMaps.launchType, req.selections.launchType)}`,
       `Holding period: ${mapLabel(labelMaps.holdingPeriod, req.selections.holdingPeriod)}`,
       `Likely exit: ${mapLabel(labelMaps.exitOption, req.selections.exitOption)}`,
+      `Planned life changes: ${
+        req.selections.lifeChanges
+          ? mapLabel(
+              labelMaps.lifeChanges as unknown as Record<string, string>,
+              String(req.selections.lifeChanges ?? ''),
+            )
+          : '-'
+      }`,
     ].filter(Boolean);
 
     const textBody =

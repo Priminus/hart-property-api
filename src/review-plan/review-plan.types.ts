@@ -13,6 +13,7 @@ export type ReviewPlanSelections = {
   exitOption: string;
   targetBuyer: string;
   stability: string;
+  lifeChanges?: string;
 };
 
 export type ReviewPlanRequest = {
