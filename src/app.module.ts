@@ -5,6 +5,7 @@ import { ArticlesModule } from './articles/articles.module';
 import { ListingsModule } from './listings/listings.module';
 import { ReviewPlanModule } from './review-plan/review-plan.module';
 import { SupabaseModule } from './supabase/supabase.module';
+import { FaviconController } from './favicon.controller';
 
 @Module({
   imports: [
@@ -13,7 +14,7 @@ import { SupabaseModule } from './supabase/supabase.module';
     ListingsModule,
     ReviewPlanModule,
   ],
-  controllers: [AppController],
+  controllers: [AppController, FaviconController],
   providers: [AppService],
 })
 export class AppModule {}
