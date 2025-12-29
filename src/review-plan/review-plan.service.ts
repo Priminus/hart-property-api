@@ -995,14 +995,21 @@ export class ReviewPlanService {
       },
     });
 
-    if (!validation.valid) {
-      console.log(`[ReviewPlan] Email validation failed for ${email}`);
-      const reason = validation.reason ?? 'invalid';
+    const reason = validation.reason ?? 'invalid';
+    if (!validation.valid && reason !== 'disposable') {
+      console.log(
+        `[ReviewPlan] Email validation failed for ${email} (reason=${reason})`,
+      );
       const suggestion = validation.validators.typo?.error?.suggestion;
       return {
         ok: false,
         error: `Invalid email (${reason}).${suggestion ? ` Suggestion: ${suggestion}` : ''}`,
       } as const;
+    }
+    if (!validation.valid && reason === 'disposable') {
+      console.log(
+        `[ReviewPlan] Email flagged as disposable for ${email} — allowing request to continue`,
+      );
     }
 
     // Start background job - don't await this
