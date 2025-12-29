@@ -90,7 +90,12 @@ const labelMaps = {
   cashRange: { c1: '<$150k', c2: '$150–250k', c3: '$250–400k', c4: '$400k+' },
   cpfRange: { cpf1: '<$50k', cpf2: '$50–150k', cpf3: '$150k+' },
   bufferRange: { b1: '<3', b2: '3–6', b3: '6–12', b4: '12+' },
-  priceRange: { p1: '<$1.2m', p2: '$1.2–1.6m', p3: '$1.6–2.0m', p4: '$2.0m+' },
+  priceRange: {
+    p1: '$0.9–1.2m',
+    p2: '$1.2–1.6m',
+    p3: '$1.6–2.0m',
+    p4: '$2.0m+',
+  },
   locationPref: { ocr: 'OCR', rcr: 'RCR', ccr: 'CCR', flexible: 'Flexible' },
   launchType: { new: 'New', resale: 'Resale', open: 'Open' },
   holdingPeriod: { h1: '<3 yrs', h2: '3–5 yrs', h3: '5–10 yrs', h4: '10+ yrs' },
@@ -911,7 +916,15 @@ async function fetchGptListings(
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return [];
 
-  const client = new OpenAI({ apiKey });
+  // Important: On some hosts, a single long-lived await to the Responses API can appear to "hang"
+  // indefinitely. We use Background Mode + polling with hard timeouts so this step cannot block
+  // the job for hours.
+  const client = new OpenAI({
+    apiKey,
+    // OpenAI Node SDK supports a request timeout (ms). Keep it bounded so network stalls don't hang the job.
+    // (This is best-effort; if the SDK version changes, the polling deadline below is still the guardrail.)
+    timeout: 15_000,
+  });
   const priceLabel = mapLabel(
     labelMaps.priceRange as unknown as Record<string, string>,
     selections.priceRange,
@@ -919,27 +932,110 @@ async function fetchGptListings(
 
   const input = `can you search propertyguru for private condo sales in the range ${priceLabel}. find me listings from 3 condos. return listings in this JSON format with no other output, give me 3 listings per condo { condo: xxx, bedrooms: [2,3], price_lower: S$1.52M, price_higher: S$1.6M, size_lower: 600sqft, size_higher: 800 sqft, listings: [ { bedrooms: 2, price: $1.6M, size: 742sqft, url: https://xxxxx, ] } please make sure the URLs are to the actual listings and are navigatable, and not to the search results page. Return ONLY valid JSON array.`;
 
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  const extractOutputText = (resp: unknown): string | undefined => {
+    if (!resp || typeof resp !== 'object') return undefined;
+    const r = resp as Record<string, unknown>;
+
+    const direct =
+      r['output_text'] ??
+      (r['output'] as any)?.[0]?.content ??
+      (r['choices'] as any)?.[0]?.message?.content ??
+      r['text'];
+
+    return typeof direct === 'string' ? direct : undefined;
+  };
+
   try {
-    // Using the user's specific GPT-5 / Search API snippet
-    // We use 'any' to bypass potential type mismatches if the SDK is not yet updated for this beta API
-    const response: any = await (client as any).responses.create({
-      model: 'gpt-5', // User specified gpt-5
+    // Background Mode: returns quickly with an id; we then poll for completion.
+    // Docs: https://platform.openai.com/docs/guides/background
+    const created: any = await (client as any).responses.create({
+      model: 'gpt-5',
       tools: [{ type: 'web_search' }],
       input,
+      background: true,
     });
 
+    const responseId: string | undefined =
+      created?.id || created?.response_id || created?.response?.id;
+
+    if (!responseId) {
+      console.log(
+        '[GPT Debug] Missing response id from background create:',
+        JSON.stringify(created, null, 2),
+      );
+      return [];
+    }
+
+    const createdStatus = String(created?.status ?? '').toLowerCase();
+    if (
+      createdStatus &&
+      createdStatus !== 'in_progress' &&
+      createdStatus !== 'queued'
+    ) {
+      console.log(
+        '[GPT Debug] Background create returned status:',
+        createdStatus,
+      );
+    }
+
+    const maxWaitMs = 60 * 60 * 1000; // 1 hour hard deadline for this step
+    const start = Date.now();
+    let attempt = 0;
+
+    let finalResponse: unknown = undefined;
+    while (Date.now() - start < maxWaitMs) {
+      attempt += 1;
+
+      const polled: any = await (client as any).responses.retrieve(responseId);
+      const status = String(polled?.status ?? '').toLowerCase();
+
+      if (status === 'completed') {
+        finalResponse = polled;
+        break;
+      }
+
+      if (
+        status === 'failed' ||
+        status === 'cancelled' ||
+        status === 'expired'
+      ) {
+        console.log('[GPT Debug] Response ended early:', {
+          responseId,
+          status,
+        });
+        return [];
+      }
+
+      // Heartbeat log (throttled) to help debug server freezes.
+      if (attempt === 1 || attempt % 5 === 0) {
+        console.log('[GPT Debug] Polling response...', {
+          responseId,
+          status: status || 'unknown',
+          elapsedMs: Date.now() - start,
+        });
+      }
+
+      // Backoff with cap to keep load low for long-running jobs (2s → 30s)
+      const delayMs = Math.min(30_000, 2000 + attempt * 1250);
+      await sleep(delayMs);
+    }
+
+    if (!finalResponse) {
+      console.log('[GPT Debug] Timed out waiting for response completion:', {
+        responseId,
+        elapsedMs: Date.now() - start,
+      });
+      return [];
+    }
+
     console.log(
-      '[GPT Debug] Full API Response:',
-      JSON.stringify(response, null, 2),
+      '[GPT Debug] Final API Response:',
+      JSON.stringify(finalResponse, null, 2),
     );
 
-    // Based on the user's expected output format
-    const content =
-      response.output_text ||
-      response.output?.[0]?.content ||
-      response.choices?.[0]?.message?.content ||
-      response.text;
-
+    const content = extractOutputText(finalResponse);
     console.log('[GPT Debug] Extracted content:', content);
 
     if (!content) return [];
