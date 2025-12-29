@@ -1002,9 +1002,10 @@ export class ReviewPlanService {
     const client = new postmark.ServerClient(postmarkKey);
 
     const subject = 'Your buying plan memo (Hart Property)';
+    // Email clients frequently do not render SVGs. Use a PNG for email.
     const logoUrl = process.env.PUBLIC_ASSETS_BASE_URL
-      ? `${process.env.PUBLIC_ASSETS_BASE_URL.replace(/\/$/, '')}/hart-logo.svg`
-      : 'https://hartproperty.sg/hart-logo.svg';
+      ? `${process.env.PUBLIC_ASSETS_BASE_URL.replace(/\/$/, '')}/hart-logo.png`
+      : 'https://hartproperty.sg/hart-logo.png';
 
     const selectionLines = [
       `Buyer type: ${mapLabel(labelMaps.buyerType, req.selections.buyerType)}`,
