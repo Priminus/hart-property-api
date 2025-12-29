@@ -1014,7 +1014,8 @@ export class ReviewPlanService {
 
     // Start background job - don't await this
     this.runBackgroundGeneration(req, email).catch((err) => {
-      console.error(
+      // Use stdout for visibility on platforms that don't capture stderr reliably.
+      console.log(
         `[ReviewPlan] Critical error in background job for ${email}:`,
         err,
       );
@@ -1027,10 +1028,15 @@ export class ReviewPlanService {
   }
 
   private async runBackgroundGeneration(req: ReviewPlanRequest, email: string) {
+    console.log(`[ReviewPlan] [${email}] Background job entered`);
     const postmarkKey = process.env.POSTMARK_API_KEY;
     const from = process.env.POSTMARK_FROM;
 
     if (!postmarkKey || !from) {
+      console.log(`[ReviewPlan] [${email}] Missing Postmark env vars`, {
+        hasPostmarkKey: Boolean(postmarkKey),
+        hasFrom: Boolean(from),
+      });
       throw new Error('Missing POSTMARK_API_KEY or POSTMARK_FROM');
     }
 
