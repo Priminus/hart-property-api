@@ -165,9 +165,16 @@ function pricePointsForRange(priceRange: string): number[] {
 }
 
 function computeBsd(price: number) {
-  // Singapore BSD (residential) tiers (commonly used):
-  // 1% first 180k, 2% next 180k, 3% next 640k, 4% next 500k, 5% next 1.5m, 6% remaining.
-  // NOTE: This is an estimate and may not include ABSD or any future changes.
+  // Singapore BSD (residential) tier rates (as per 2025 schedule):
+  // 1% first S$180,000
+  // 2% next  S$180,000
+  // 3% next  S$640,000
+  // 4% next  S$500,000
+  // 5% next  S$1,500,000  (i.e. up to S$3,000,000 total)
+  // 6% amount exceeding S$3,000,000
+  //
+  // NOTE: This is BSD only. It excludes ABSD and any future changes.
+  if (!Number.isFinite(price) || price <= 0) return 0;
   const tiers: Array<[number, number]> = [
     [180_000, 0.01],
     [180_000, 0.02],
