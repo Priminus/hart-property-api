@@ -8,6 +8,18 @@ async function bootstrap() {
     origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
     credentials: true,
   });
-  await app.listen(process.env.PORT ?? 3001);
+  const port = Number(process.env.PORT ?? 3001);
+  await app.listen(port);
+
+  // Always print effective port for visibility in logs (local + prod).
+  const url = await app.getUrl();
+  console.log(`[API] Listening on ${url} (port=${port})`);
+
+  // Helpful hint when running in serverless-style environments where "listening" may not apply.
+  if (process.env.VERCEL) {
+    console.log(
+      '[API] Detected Vercel environment; requests may run as Serverless Functions rather than a long-lived server.',
+    );
+  }
 }
 bootstrap();
