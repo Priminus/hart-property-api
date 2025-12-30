@@ -2,10 +2,13 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import PDFDocument from 'pdfkit';
 import SVGtoPDF from 'svg-to-pdfkit';
+import { Inject, Injectable } from '@nestjs/common';
 import { validate as validateEmail } from '@mailtester/core';
 import * as postmark from 'postmark';
 import OpenAI from 'openai';
 import cloudscraper from 'cloudscraper';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { SUPABASE_CLIENT } from '../supabase/supabase.constants';
 import type {
   ReviewPlanRequest,
   ReviewPlanSelections,
@@ -426,6 +429,13 @@ async function renderPdf({
 
   const logoPath = path.resolve(process.cwd(), 'assets/hart-logo.svg');
   const logoSvg = await fs.readFile(logoPath, 'utf8');
+  const whatsappSvgPath = path.resolve(process.cwd(), 'assets/whatsapp.svg');
+  let whatsappSvg: string | null = null;
+  try {
+    whatsappSvg = await fs.readFile(whatsappSvgPath, 'utf8');
+  } catch {
+    whatsappSvg = null;
+  }
 
   const bottomLimit = () => doc.page.height - doc.page.margins.bottom;
   const ensureSpace = (needed: number) => {
@@ -815,16 +825,6 @@ async function renderPdf({
         align: 'left',
       });
 
-    doc.moveDown(0.5);
-    doc
-      .font('Helvetica')
-      .fontSize(9)
-      .fillColor('#3E5C8A')
-      .text(
-        'Note: These listings are generated using AI and may not be accurate. Please verify the information independently before making any decision.',
-        { align: 'left' },
-      );
-
     doc.moveDown(0.75);
 
     for (const group of gptListings) {
@@ -840,39 +840,53 @@ async function renderPdf({
 
       doc.moveDown(0.4);
 
-      for (let i = 0; i < group.listings.length; i++) {
-        const item = group.listings[i];
-        const isLast = i === group.listings.length - 1;
-        const rowText = `${item.bedrooms}BR | ${item.size} | ${item.price}`;
+      // Replace unit-level listings with a per-development CTA.
+      const message = `I'm interested in a breakdown for condo ${group.condo}`;
+      const waLink = `https://wa.me/6593490577?text=${encodeURIComponent(message)}`;
 
-        const startY = doc.y;
+      const btnW = 240;
+      const btnH = 28;
+      const btnX = (doc.page.width - btnW) / 2;
+      const btnY = doc.y;
+
+      doc.save();
+      doc.roundedRect(btnX, btnY, btnW, btnH, 8).fillColor('#25D366').fill();
+
+      // Icon
+      const iconSize = 16;
+      const iconX = btnX + 14;
+      const iconY = btnY + (btnH - iconSize) / 2;
+      if (whatsappSvg) {
+        doc.save();
+        SVGtoPDF(doc as unknown as never, whatsappSvg, iconX, iconY, {
+          width: iconSize,
+          height: iconSize,
+          preserveAspectRatio: 'xMidYMid meet',
+        });
+        doc.restore();
+      } else {
         doc
-          .font('Helvetica')
-          .fontSize(10)
-          .fillColor('#1F2933')
-          .text(rowText, 58, startY);
-
-        // Keep link text ASCII to avoid glyph substitution artifacts in PDF renderers
-        const linkText = 'View listing';
-        const linkWidth = doc.widthOfString(linkText);
-        doc
-          .fillColor('#4C7DBF')
-          .text(linkText, doc.page.width - 48 - linkWidth, startY, {
-            link: item.url,
-            underline: true,
-          });
-
-        doc.moveDown(0.2);
-        if (!isLast) {
-          doc
-            .moveTo(58, doc.y)
-            .lineTo(doc.page.width - 48, doc.y)
-            .strokeColor('#E2E8F0')
-            .lineWidth(0.5)
-            .stroke();
-          doc.moveDown(0.2);
-        }
+          .font('Helvetica-Bold')
+          .fontSize(9)
+          .fillColor('#FFFFFF')
+          .text('WA', iconX, iconY + 2, { width: iconSize, align: 'center' });
       }
+
+      doc
+        .font('Helvetica-Bold')
+        .fontSize(10)
+        .fillColor('#FFFFFF')
+        .text('Request a breakdown', btnX, btnY + 8, {
+          width: btnW,
+          align: 'center',
+          link: waLink,
+        });
+
+      // Make the entire button clickable.
+      doc.link(btnX, btnY, btnW, btnH, waLink);
+      doc.restore();
+
+      doc.y = btnY + btnH;
       doc.moveDown(0.8);
       doc.x = 48; // Reset x to left margin after each development block
     }
@@ -931,104 +945,109 @@ async function isValidPropertyGuruListingUrl(url: string): Promise<boolean> {
     return false;
   }
 
+  // Must include a numeric listing ID in the URL, otherwise treat as invalid.
+  // Example: https://www.propertyguru.com.sg/listing/for-sale-parc-rosewood-60171136
+  const listingIdMatch = url.match(/\/listing\/[^?#]*-(\d+)(?:[/?#]|$)/i);
+  const listingId = listingIdMatch?.[1];
+  if (!listingId) {
+    console.log('[PG Validate] ❌ Missing listing ID in URL');
+    return false;
+  }
+
+  const apiKey = process.env.GOOGLE_SEARCH_API_KEY;
+  const cx =
+    process.env.GOOGLE_SEARCH_ENGINE_ID ?? process.env.GOOGLE_SEARCH_CX;
+  if (!apiKey || !cx) {
+    console.log('[PG Validate] ❌ Missing Google Search env vars', {
+      hasApiKey: Boolean(apiKey),
+      hasCx: Boolean(cx),
+    });
+    return false;
+  }
+
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const normalizeUrl = (u: string) =>
+    u
+      .trim()
+      .replace(/[?#].*$/, '')
+      .replace(/\/$/, '')
+      .toLowerCase();
 
-  // Cloudflare challenge pages can cause fetch() to return interstitial HTML.
-  // Use cloudscraper to solve challenges when possible.
-  const cs = cloudscraper as unknown as {
-    get: (opts: Record<string, unknown>) => Promise<string>;
-  };
-
-  const isBlockedHtml = (html: string) => {
-    const head = html.slice(0, 6000).toLowerCase();
-    return (
-      head.includes('403') ||
-      head.includes('access denied') ||
-      head.includes('request blocked') ||
-      head.includes('error 1020') ||
-      head.includes('cloudflare')
-    );
-  };
+  const want = normalizeUrl(url);
+  // Use listingId for the query (site: expects a domain, not a full URL).
+  // This is generally more reliable than searching for the exact URL string.
+  const q = `site:${url}`;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const html = await cs.get({
-        uri: url,
-        timeout: 7000,
-        gzip: true,
+      const endpoint =
+        'https://www.googleapis.com/customsearch/v1' +
+        `?key=${encodeURIComponent(apiKey)}` +
+        `&cx=${encodeURIComponent(cx)}` +
+        `&q=${encodeURIComponent(q)}` +
+        `&num=5`;
+
+      const res = await fetch(endpoint, {
+        method: 'GET',
         headers: {
-          // A basic UA helps avoid some bot blocks returning generic pages.
-          'User-Agent':
-            'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36',
-          Accept:
-            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          Accept: 'application/json',
         },
       });
 
-      // If we clearly got a block page, retry a couple times.
-      if (attempt < 3 && isBlockedHtml(html)) {
-        console.log('[PG Validate] ⚠️ 403/block page detected, retrying...', {
+      if (!res.ok) {
+        const shouldRetry =
+          attempt < 3 && (res.status === 403 || res.status === 429);
+        console.log('[PG Validate] Google Search API non-OK', {
           url,
+          listingId,
           attempt,
+          status: res.status,
+          note: shouldRetry ? 'retrying' : 'not retrying',
         });
-        await sleep(600 * attempt);
-        continue;
+        if (shouldRetry) {
+          await sleep(700 * attempt);
+          continue;
+        }
+        return false;
       }
 
-      // Heuristics to distinguish a real listing page from a search results / generic page.
-      console.log('[PG Validate] HTML length:', html.length);
-
-      // More tolerant matching than strict includes (PropertyGuru HTML varies / minifies).
-      const aboutRegex =
-        /<h2[^>]*class=["']title["'][^>]*>\s*About this property\s*<\/h2>/i;
-      const imageRegex =
-        /hui-image--1_1[\s\S]{0,120}media-image[\s\S]{0,120}images/i;
-
-      const hasAbout = aboutRegex.test(html);
-      const hasImage = imageRegex.test(html);
-
-      console.log('[PG Validate] Marker check:', {
-        hasAbout,
-        hasImage,
-        includesAboutLiteral: html.includes(
-          '<h2 class="title">About this property</h2>',
-        ),
-        includesImageLiteral: html.includes(
-          'hui-image hui-image--1_1 media-image images',
-        ),
-      });
-
-      const ok = hasAbout || hasImage;
-      console.log(
-        ok
-          ? '[PG Validate] ✅ Valid listing page'
-          : '[PG Validate] ❌ Missing markers',
-      );
-      return ok;
-    } catch (err) {
-      const e = err as {
-        name?: unknown;
-        message?: unknown;
-        code?: unknown;
-        statusCode?: unknown;
+      const data = (await res.json()) as {
+        items?: Array<{ link?: string }>;
       };
-      const statusCode =
-        typeof e?.statusCode === 'number' ? e.statusCode : undefined;
+      const links = (data.items ?? [])
+        .map((it) => it?.link)
+        .filter((x): x is string => typeof x === 'string');
 
-      const shouldRetry = attempt < 3 && statusCode === 403;
-      console.log('[PG Validate] ❌ Request failed (cloudscraper)', {
+      const foundExact = links.some((l) => normalizeUrl(l) === want);
+      const foundSameId = links.some((l) =>
+        new RegExp(`-${listingId}(?:[/?#]|$)`, 'i').test(l),
+      );
+
+      console.log('[PG Validate] Google Search check', {
         url,
-        attempt,
-        statusCode,
-        name: typeof e?.name === 'string' ? e.name : undefined,
-        code: typeof e?.code === 'string' ? e.code : undefined,
-        ...(shouldRetry
-          ? { note: '403 received; retrying' }
-          : { note: 'not retrying' }),
+        listingId,
+        results: links.length,
+        foundExact,
+        foundSameId,
       });
 
+      // Treat as valid if there is any matching search result.
+      return foundExact || foundSameId;
+    } catch (err) {
+      const e = err as { name?: unknown; message?: unknown };
+      const message =
+        typeof e?.message === 'string' ? e.message : 'Unknown error';
+      const shouldRetry = attempt < 3;
+      console.log('[PG Validate] Google Search API request failed', {
+        url,
+        listingId,
+        attempt,
+        name: typeof e?.name === 'string' ? e.name : undefined,
+        message,
+        note: shouldRetry ? 'retrying' : 'not retrying',
+      });
       if (shouldRetry) {
-        await sleep(600 * attempt);
+        await sleep(700 * attempt);
         continue;
       }
       return false;
@@ -1053,13 +1072,17 @@ async function validateGptListings(
   // Keep concurrency small to avoid hammering the target site.
   const concurrency = 3;
 
-  async function worker(group: GptListing): Promise<GptListing | null> {
+  async function worker(
+    group: GptListing,
+    maxListingsForGroup: number,
+  ): Promise<GptListing | null> {
     console.log('[PG Validate] Validating development:', group.condo);
     const items = group.listings;
     const out: typeof items = [];
 
     let i = 0;
     while (i < items.length) {
+      if (out.length >= maxListingsForGroup) break;
       const chunk = items.slice(i, i + concurrency);
       const results = await Promise.all(
         chunk.map(async (it) => ({
@@ -1068,6 +1091,7 @@ async function validateGptListings(
         })),
       );
       for (const r of results) {
+        if (out.length >= maxListingsForGroup) break;
         console.log('[PG Validate] URL result:', {
           condo: group.condo,
           url: r.it.url,
@@ -1083,11 +1107,18 @@ async function validateGptListings(
   }
 
   const validated: GptListing[] = [];
+  let totalValid = 0;
+  const maxTotalValid = 9;
   for (const group of cleaned) {
+    const remaining = maxTotalValid - totalValid;
+    if (remaining <= 0) break;
     // Intentionally sequential per development (with small concurrency per URL batch above)
     // to avoid hammering the target site.
-    const v = await worker(group);
-    if (v) validated.push(v);
+    const v = await worker(group, remaining);
+    if (v) {
+      validated.push(v);
+      totalValid += v.listings.length;
+    }
   }
 
   return validated;
@@ -1113,7 +1144,7 @@ async function fetchGptListings(
     selections.priceRange,
   );
 
-  const input = `can you search propertyguru for private condo sales in the range ${priceLabel}. find me listings from 3 condos. return listings in this JSON format with no other output, give me 3 listings per condo { condo: xxx, bedrooms: [2,3], price_lower: S$1.52M, price_higher: S$1.6M, size_lower: 600sqft, size_higher: 800 sqft, listings: [ { bedrooms: 2, price: $1.6M, size: 742sqft, url: https://xxxxx, ] } please make sure the URLs are to the actual listings and are navigatable, and not to the search results page. Return ONLY valid JSON array.`;
+  const input = `can you search propertyguru for private condo sales in the range ${priceLabel}. find me listings from 5 condos. return listings in this JSON format with no other output, give me 3 listings per condo { condo: xxx, bedrooms: [2,3], price_lower: S$1.52M, price_higher: S$1.6M, size_lower: 600sqft, size_higher: 800 sqft, listings: [ { bedrooms: 2, price: $1.6M, size: 742sqft, url: https://xxxxx, ] } please make sure the URLs are to the actual listings and are navigatable, and not to the search results page. Return ONLY valid JSON array.`;
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -1257,7 +1288,12 @@ async function fetchGptListings(
   }
 }
 
+@Injectable()
 export class ReviewPlanService {
+  constructor(
+    @Inject(SUPABASE_CLIENT) private readonly supabase: SupabaseClient,
+  ) {}
+
   async sendPlan(req: ReviewPlanRequest) {
     const email = (req.email ?? '').trim().toLowerCase();
     if (!email) {
@@ -1293,8 +1329,33 @@ export class ReviewPlanService {
       );
     }
 
+    // Persist submission immediately (so we store user selections even in serverless envs).
+    let submissionId: string | null = null;
+    const created = await this.supabase
+      .from('review_plan_submissions')
+      .insert({
+        email,
+        name: req.name ?? null,
+        selections: req.selections,
+        status: 'submitted',
+      })
+      .select('id')
+      .maybeSingle();
+    if (created.error) {
+      console.log('[ReviewPlan] Failed to create submission record', {
+        email,
+        error: created.error.message,
+      });
+    } else {
+      submissionId = created.data?.id ?? null;
+      console.log('[ReviewPlan] Created submission record', {
+        email,
+        id: submissionId,
+      });
+    }
+
     // Start background job - don't await this
-    this.runBackgroundGeneration(req, email).catch((err) => {
+    this.runBackgroundGeneration(req, email, submissionId).catch((err) => {
       // Use stdout for visibility on platforms that don't capture stderr reliably.
       console.log(
         `[ReviewPlan] Critical error in background job for ${email}:`,
@@ -1308,7 +1369,11 @@ export class ReviewPlanService {
     return { ok: true, message: 'Plan generation started.' } as const;
   }
 
-  private async runBackgroundGeneration(req: ReviewPlanRequest, email: string) {
+  private async runBackgroundGeneration(
+    req: ReviewPlanRequest,
+    email: string,
+    submissionId: string | null,
+  ) {
     console.log(`[ReviewPlan] [${email}] Background job entered`);
     const postmarkKey = process.env.POSTMARK_API_KEY;
     const from = process.env.POSTMARK_FROM;
@@ -1326,6 +1391,90 @@ export class ReviewPlanService {
     console.log(
       `[ReviewPlan] [${email}] Step 1: GPT listings fetched (${gptListings.length} found)`,
     );
+
+    // Persist all memo inputs/outputs to DB (including validated listing URLs),
+    // even though we do not show unit-level listings in the PDF.
+    const funds = cashCpfFromSelections(req.selections);
+    const prices = pricePointsForRange(req.selections.priceRange);
+    const sora = await fetchSoraSnapshot();
+    const res = assess(req.selections, funds);
+    const region = growthRegions.includes(req.selections.locationPref)
+      ? (req.selections.locationPref as keyof typeof growth)
+      : null;
+
+    const capitalAnalyses = prices.map((p) => {
+      const b = computeUpfront({
+        price: p,
+        cash: funds.cash,
+        cpf: funds.cpf,
+        ageRange: req.selections.ageRange,
+      });
+
+      let monthlyRepayments: { low: number; high: number } | null = null;
+      if (sora) {
+        const lowAnnual = (sora.oneMonth + 0.3) / 100;
+        const highAnnual = (sora.sixMonth + 0.6) / 100;
+        const months = b.loanTenure * 12;
+        const low = computeMonthlyRepayment({
+          principal: b.maxLoan,
+          annualRate: lowAnnual,
+          months,
+        });
+        const high = computeMonthlyRepayment({
+          principal: b.maxLoan,
+          annualRate: highAnnual,
+          months,
+        });
+        monthlyRepayments = {
+          low: Math.min(low, high),
+          high: Math.max(low, high),
+        };
+      }
+
+      return {
+        price: p,
+        breakdown: b,
+        monthlyRepayments,
+      };
+    });
+
+    const assessmentOk = res.status === 'pass';
+    if (submissionId) {
+      const updated = await this.supabase
+        .from('review_plan_submissions')
+        .update({
+          market_context: region
+            ? {
+                region: region,
+                regionLabel: mapLabel(labelMaps.locationPref, region),
+                growth: growth[region],
+                note: 'Non-landed private condos: Average annual PSF growth (2020–2023). Note: Based on district-level average YoY PSF changes derived from private non-landed transactions between 2020 and 2023.',
+              }
+            : null,
+          client_capital: {
+            funds,
+            analyses: capitalAnalyses,
+            assumptions:
+              '25% downpayment (min 5% cash), excludes ABSD, legal/misc are estimates.',
+          },
+          assessment: {
+            ok: assessmentOk,
+            status: res.status,
+            message: res.message,
+          },
+          listings: gptListings,
+          sora_snapshot: sora,
+          status: 'generated',
+        })
+        .eq('id', submissionId);
+      if (updated.error) {
+        console.log('[ReviewPlan] Failed to update submission record', {
+          email,
+          id: submissionId,
+          error: updated.error.message,
+        });
+      }
+    }
 
     console.log(`[ReviewPlan] [${email}] Step 2: Generating PDF memo...`);
     const pdf = await renderPdf({
