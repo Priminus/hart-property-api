@@ -1004,6 +1004,8 @@ async function fetchGptListings(
         console.log('[GPT Debug] Response ended early:', {
           responseId,
           status,
+          error: polled?.error,
+          incomplete_details: polled?.incomplete_details,
         });
         return [];
       }
@@ -1014,8 +1016,6 @@ async function fetchGptListings(
           responseId,
           status: status || 'unknown',
           elapsedMs: Date.now() - start,
-          error: polled?.error,
-          incomplete_details: polled?.incomplete_details,
         });
       }
 
