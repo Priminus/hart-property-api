@@ -1014,6 +1014,8 @@ async function fetchGptListings(
           responseId,
           status: status || 'unknown',
           elapsedMs: Date.now() - start,
+          error: polled?.error,
+          incomplete_details: polled?.incomplete_details,
         });
       }
 
