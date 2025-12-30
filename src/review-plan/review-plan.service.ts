@@ -124,6 +124,97 @@ function money(n: number) {
   return `S$${rounded.toLocaleString('en-SG')}`;
 }
 
+type SoraSnapshot = {
+  oneMonth: number; // percent, e.g. 1.16900
+  sixMonth: number; // percent, e.g. 1.32760
+  asAt?: string; // dd/mm/yyyy
+};
+
+let soraCache: { fetchedAt: number; data: SoraSnapshot } | null = null;
+
+async function fetchSoraSnapshot(): Promise<SoraSnapshot | null> {
+  const cacheTtlMs = 6 * 60 * 60 * 1000; // 6 hours
+  const now = Date.now();
+  if (soraCache && now - soraCache.fetchedAt < cacheTtlMs) {
+    return soraCache.data;
+  }
+
+  const url = 'https://housingloansg.com/hl/charts/sibor-sor-daily-chart';
+  try {
+    const html = (await (cloudscraper as any).get({
+      uri: url,
+      // Keep a UA set; some hosts behave differently without it.
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (compatible; HartPropertyBot/1.0; +https://hartproperty.sg)',
+      },
+      timeout: 15_000,
+    })) as string;
+
+    const oneM = html.match(
+      /<td[^>]*>\s*1\s*Mth\s*<\/td>\s*<td[^>]*>\s*([0-9]+(?:\.[0-9]+)?)\s*<\/td>/i,
+    )?.[1];
+    const sixM = html.match(
+      /<td[^>]*>\s*6\s*Mth\s*<\/td>\s*<td[^>]*>\s*([0-9]+(?:\.[0-9]+)?)\s*<\/td>/i,
+    )?.[1];
+    const asAt = html.match(
+      /<td[^>]*>\s*As\s*at\s*<\/td>\s*<td[^>]*>\s*([0-9]{1,2}\/[0-9]{1,2}\/[0-9]{4})\s*<\/td>/i,
+    )?.[1];
+
+    const oneMonth = oneM ? Number(oneM) : NaN;
+    const sixMonth = sixM ? Number(sixM) : NaN;
+    if (!Number.isFinite(oneMonth) || !Number.isFinite(sixMonth)) {
+      console.log('[SORA] Failed to parse SORA snapshot', {
+        url,
+        oneM,
+        sixM,
+        asAt,
+      });
+      return null;
+    }
+
+    const data: SoraSnapshot = { oneMonth, sixMonth, asAt };
+    soraCache = { fetchedAt: now, data };
+    console.log('[SORA] Fetched snapshot', { ...data, url });
+    return data;
+  } catch (e) {
+    const err = e as {
+      name?: unknown;
+      message?: unknown;
+      code?: unknown;
+      statusCode?: unknown;
+    };
+    console.log('[SORA] Failed to fetch snapshot', {
+      url,
+      name: typeof err?.name === 'string' ? err.name : undefined,
+      code: typeof err?.code === 'string' ? err.code : undefined,
+      statusCode:
+        typeof err?.statusCode === 'number' ? err.statusCode : undefined,
+      message: typeof err?.message === 'string' ? err.message : 'Unknown error',
+    });
+    return null;
+  }
+}
+
+function computeMonthlyRepayment({
+  principal,
+  annualRate,
+  months,
+}: {
+  principal: number;
+  annualRate: number; // decimal, e.g. 0.03
+  months: number;
+}): number {
+  if (!Number.isFinite(principal) || principal <= 0) return 0;
+  if (!Number.isFinite(months) || months <= 0) return 0;
+  if (!Number.isFinite(annualRate) || annualRate <= 0) {
+    return principal / months;
+  }
+  const r = annualRate / 12;
+  const pow = Math.pow(1 + r, months);
+  return (principal * r * pow) / (pow - 1);
+}
+
 function parseLowerBoundFromRangeLabel(label: string): number {
   // Examples: "<$150k", "$150–250k", "$250–400k", "$400k+"
   const cleaned = label.replace(/[,\s]/g, '');
@@ -571,6 +662,16 @@ async function renderPdf({
 
     doc.moveDown(0.2);
     doc
+      .font('Helvetica')
+      .fontSize(9)
+      .fillColor('#3E5C8A')
+      .text(
+        'Note: Based on district-level average YoY PSF changes derived from private non-landed transactions between 2020 and 2023.',
+        { align: 'left' },
+      );
+
+    doc.moveDown(0.2);
+    doc
       .font('Helvetica-Bold')
       .fontSize(10)
       .fillColor('#1F2933')
@@ -594,7 +695,7 @@ async function renderPdf({
     .fontSize(9)
     .fillColor('#3E5C8A')
     .text(
-      'Assumptions: 25% downpayment (min 5% cash), excludes ABSD, legal/misc are estimates.',
+      'Assumptions: 25% downpayment (min 5% cash), excludes ABSD, legal/misc are estimates. Estimated monthly repayments use (1M SORA + 0.3%) to (6M SORA + 0.6%).',
       { align: 'left' },
     );
 
@@ -605,6 +706,8 @@ async function renderPdf({
   drawTableRow('CPF OA', money(funds.cpf), {
     isLast: true,
   });
+
+  const sora = await fetchSoraSnapshot();
 
   const prices = pricePointsForRange(selections.priceRange);
   for (const p of prices) {
@@ -624,6 +727,30 @@ async function renderPdf({
 
     doc.moveDown(0.5);
 
+    let repaymentRangeText: string | null = null;
+    if (sora) {
+      // Requirements:
+      // - low: 1M SORA + 0.3% spread
+      // - high: 6M SORA + 0.6% spread
+      const lowAnnual = (sora.oneMonth + 0.3) / 100;
+      const highAnnual = (sora.sixMonth + 0.6) / 100;
+      const months = b.loanTenure * 12;
+
+      const low = computeMonthlyRepayment({
+        principal: b.maxLoan,
+        annualRate: lowAnnual,
+        months,
+      });
+      const high = computeMonthlyRepayment({
+        principal: b.maxLoan,
+        annualRate: highAnnual,
+        months,
+      });
+      const lowFmt = money(Math.min(low, high));
+      const highFmt = money(Math.max(low, high));
+      repaymentRangeText = `${lowFmt} - ${highFmt}`;
+    }
+
     const costLines: Array<[string, string]> = [
       ['Item', 'Amount'],
       [
@@ -631,6 +758,10 @@ async function renderPdf({
         money(b.downpaymentTotal),
       ],
       [`Max Loan (${b.loanTenure} yrs @ 4.5% stress)`, money(b.maxLoan)],
+      [
+        'Estimated monthly repayments',
+        repaymentRangeText ?? 'Unavailable (SORA fetch failed)',
+      ],
       [`Buyer’s Stamp Duty (BSD) (~${b.bsdRate.toFixed(1)}%)`, money(b.bsd)],
       ['Legal fees (est.)', money(b.legalFees)],
       ['Other fees (est.)', money(b.miscFees)],
@@ -800,59 +931,111 @@ async function isValidPropertyGuruListingUrl(url: string): Promise<boolean> {
     return false;
   }
 
-  try {
-    // Cloudflare challenge pages can cause fetch() to return interstitial HTML.
-    // Use cloudscraper to solve challenges when possible.
-    const cs = cloudscraper as unknown as {
-      get: (opts: Record<string, unknown>) => Promise<string>;
-    };
-    const html = await cs.get({
-      uri: url,
-      timeout: 7000,
-      gzip: true,
-      headers: {
-        // A basic UA helps avoid some bot blocks returning generic pages.
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
-        Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-    });
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-    // Heuristics to distinguish a real listing page from a search results / generic page.
-    console.log('[PG Validate] HTML length:', html.length);
+  // Cloudflare challenge pages can cause fetch() to return interstitial HTML.
+  // Use cloudscraper to solve challenges when possible.
+  const cs = cloudscraper as unknown as {
+    get: (opts: Record<string, unknown>) => Promise<string>;
+  };
 
-    // More tolerant matching than strict includes (PropertyGuru HTML varies / minifies).
-    const aboutRegex =
-      /<h2[^>]*class=["']title["'][^>]*>\s*About this property\s*<\/h2>/i;
-    const imageRegex =
-      /hui-image--1_1[\s\S]{0,120}media-image[\s\S]{0,120}images/i;
-
-    const hasAbout = aboutRegex.test(html);
-    const hasImage = imageRegex.test(html);
-
-    console.log('[PG Validate] Marker check:', {
-      hasAbout,
-      hasImage,
-      includesAboutLiteral: html.includes(
-        '<h2 class="title">About this property</h2>',
-      ),
-      includesImageLiteral: html.includes(
-        'hui-image hui-image--1_1 media-image images',
-      ),
-    });
-
-    const ok = hasAbout || hasImage;
-    console.log(
-      ok
-        ? '[PG Validate] ✅ Valid listing page'
-        : '[PG Validate] ❌ Missing markers',
+  const isBlockedHtml = (html: string) => {
+    const head = html.slice(0, 6000).toLowerCase();
+    return (
+      head.includes('403') ||
+      head.includes('access denied') ||
+      head.includes('request blocked') ||
+      head.includes('error 1020') ||
+      head.includes('cloudflare')
     );
-    return ok;
-  } catch (err) {
-    console.log('[PG Validate] ❌ Request failed (cloudscraper)', err);
-    return false;
+  };
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const html = await cs.get({
+        uri: url,
+        timeout: 7000,
+        gzip: true,
+        headers: {
+          // A basic UA helps avoid some bot blocks returning generic pages.
+          'User-Agent':
+            'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36',
+          Accept:
+            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+      });
+
+      // If we clearly got a block page, retry a couple times.
+      if (attempt < 3 && isBlockedHtml(html)) {
+        console.log('[PG Validate] ⚠️ 403/block page detected, retrying...', {
+          url,
+          attempt,
+        });
+        await sleep(600 * attempt);
+        continue;
+      }
+
+      // Heuristics to distinguish a real listing page from a search results / generic page.
+      console.log('[PG Validate] HTML length:', html.length);
+
+      // More tolerant matching than strict includes (PropertyGuru HTML varies / minifies).
+      const aboutRegex =
+        /<h2[^>]*class=["']title["'][^>]*>\s*About this property\s*<\/h2>/i;
+      const imageRegex =
+        /hui-image--1_1[\s\S]{0,120}media-image[\s\S]{0,120}images/i;
+
+      const hasAbout = aboutRegex.test(html);
+      const hasImage = imageRegex.test(html);
+
+      console.log('[PG Validate] Marker check:', {
+        hasAbout,
+        hasImage,
+        includesAboutLiteral: html.includes(
+          '<h2 class="title">About this property</h2>',
+        ),
+        includesImageLiteral: html.includes(
+          'hui-image hui-image--1_1 media-image images',
+        ),
+      });
+
+      const ok = hasAbout || hasImage;
+      console.log(
+        ok
+          ? '[PG Validate] ✅ Valid listing page'
+          : '[PG Validate] ❌ Missing markers',
+      );
+      return ok;
+    } catch (err) {
+      const e = err as {
+        name?: unknown;
+        message?: unknown;
+        code?: unknown;
+        statusCode?: unknown;
+      };
+      const statusCode =
+        typeof e?.statusCode === 'number' ? e.statusCode : undefined;
+
+      const shouldRetry = attempt < 3 && statusCode === 403;
+      console.log('[PG Validate] ❌ Request failed (cloudscraper)', {
+        url,
+        attempt,
+        statusCode,
+        name: typeof e?.name === 'string' ? e.name : undefined,
+        code: typeof e?.code === 'string' ? e.code : undefined,
+        ...(shouldRetry
+          ? { note: '403 received; retrying' }
+          : { note: 'not retrying' }),
+      });
+
+      if (shouldRetry) {
+        await sleep(600 * attempt);
+        continue;
+      }
+      return false;
+    }
   }
+
+  return false;
 }
 
 async function validateGptListings(
