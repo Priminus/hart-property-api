@@ -6,6 +6,7 @@ import { ListingsModule } from './listings/listings.module';
 import { ReviewPlanModule } from './review-plan/review-plan.module';
 import { SupabaseModule } from './supabase/supabase.module';
 import { FaviconController } from './favicon.controller';
+import { LeadsModule } from './leads/leads.module';
 
 @Module({
   imports: [
@@ -13,6 +14,7 @@ import { FaviconController } from './favicon.controller';
     ArticlesModule,
     ListingsModule,
     ReviewPlanModule,
+    LeadsModule,
   ],
   controllers: [AppController, FaviconController],
   providers: [AppService],
