@@ -107,13 +107,16 @@ async function fileExists(p: string) {
 }
 
 function resolveLocalFilePath(ref: string, mdxFileDir: string) {
-  if (ref.startsWith('/')) {
+  // Strip query/hash for local disk resolution (keep them for the published URL).
+  const cleanRef = ref.split('#')[0].split('?')[0];
+
+  if (cleanRef.startsWith('/')) {
     // Treat as article-local asset: /x.jpg -> hart-property-api/content/assets/x.jpg
-    return path.join(ASSETS_DIR, ref.slice(1));
+    return path.join(ASSETS_DIR, cleanRef.slice(1));
   }
 
   // Relative file next to the MDX
-  return path.resolve(mdxFileDir, ref);
+  return path.resolve(mdxFileDir, cleanRef);
 }
 
 async function uploadToSupabase({
@@ -174,6 +177,7 @@ async function ingestOne(filePath: string) {
   const replacementMap = new Map<string, string>();
 
   for (const ref of refs) {
+    const queryOrHash = ref.includes('?') || ref.includes('#') ? ref.replace(ref.split('#')[0].split('?')[0], '') : '';
     const localPath = resolveLocalFilePath(ref, mdxFileDir);
     const ok = await fileExists(localPath);
     if (!ok) {
@@ -186,7 +190,8 @@ async function ingestOne(filePath: string) {
       localFilePath: localPath,
       originalRef: ref,
     });
-    replacementMap.set(ref, publicUrl);
+    // Preserve any ?v=... cache-buster in the final URL.
+    replacementMap.set(ref, `${publicUrl}${queryOrHash}`);
   }
 
   for (const [ref, url] of replacementMap.entries()) {
