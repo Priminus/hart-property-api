@@ -1,14 +1,263 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { validate as validateEmail } from '@mailtester/core';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import * as postmark from 'postmark';
 import { LeadsService } from '../leads/leads.service';
-import type { SendMarketOutlook2026Request } from './reports.types';
+import { SUPABASE_CLIENT } from '../supabase/supabase.constants';
+import type {
+  CondoSaleProfitabilityResponse,
+  CondoSaleProfitabilityByYearResponse,
+  CondoSaleProfitabilityRowsResponse,
+  SendMarketOutlook2026Request,
+} from './reports.types';
 
 @Injectable()
 export class ReportsService {
-  constructor(private readonly leads: LeadsService) {}
+  constructor(
+    private readonly leads: LeadsService,
+    @Inject(SUPABASE_CLIENT) private readonly supabase: SupabaseClient,
+  ) {}
+
+  private median(values: number[]) {
+    if (!values.length) return null;
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    if (sorted.length % 2 === 1) return sorted[mid];
+    return (sorted[mid - 1] + sorted[mid]) / 2;
+  }
+
+  async getCondoSaleProfitability(
+    condo?: string,
+  ): Promise<CondoSaleProfitabilityResponse> {
+    const condoName = (condo ?? '').trim();
+    if (!condoName) return { ok: false, error: 'Missing condo parameter.' };
+
+    const { data, error } = await this.supabase
+      .from('condo_sale_transactions')
+      .select(
+        'condo_name, purchase_price, profit, annualised_pct, purchase_date, sale_date, sale_price',
+      )
+      .eq('condo_name', condoName);
+
+    if (error) return { ok: false, error: error.message };
+    const rows = (data ?? []) as Array<{
+      condo_name: string;
+      purchase_price: unknown;
+      profit: unknown;
+      annualised_pct: unknown;
+      purchase_date: unknown;
+      sale_date: unknown;
+      sale_price: unknown;
+    }>;
+
+    const profitabilityPcts: number[] = [];
+    const annualisedPcts: number[] = [];
+
+    for (const r of rows) {
+      const purchasePrice =
+        r.purchase_price == null ? NaN : Number(r.purchase_price);
+      const profit = r.profit == null ? NaN : Number(r.profit);
+      const annualised =
+        r.annualised_pct == null ? NaN : Number(r.annualised_pct);
+
+      if (Number.isFinite(purchasePrice) && purchasePrice > 0 && Number.isFinite(profit)) {
+        profitabilityPcts.push((profit / purchasePrice) * 100);
+      }
+
+      if (Number.isFinite(annualised)) {
+        annualisedPcts.push(annualised);
+      } else {
+        // Fallback if annualised_pct isn't present: compute CAGR from dates/prices.
+        const salePrice = Number(r.sale_price);
+        const purchaseDate =
+          typeof r.purchase_date === 'string' ? new Date(r.purchase_date) : null;
+        const saleDate =
+          typeof r.sale_date === 'string' ? new Date(r.sale_date) : null;
+        if (
+          Number.isFinite(purchasePrice) &&
+          Number.isFinite(salePrice) &&
+          purchasePrice > 0 &&
+          salePrice > 0 &&
+          purchaseDate &&
+          saleDate &&
+          Number.isFinite(purchaseDate.getTime()) &&
+          Number.isFinite(saleDate.getTime())
+        ) {
+          const days = (saleDate.getTime() - purchaseDate.getTime()) / (1000 * 60 * 60 * 24);
+          if (days > 0) {
+            const cagr = Math.pow(salePrice / purchasePrice, 365 / days) - 1;
+            annualisedPcts.push(cagr * 100);
+          }
+        }
+      }
+    }
+
+    const medianProfitability = this.median(profitabilityPcts);
+    const medianAnnualised = this.median(annualisedPcts);
+
+    if (medianProfitability === null || medianAnnualised === null) {
+      return { ok: false, error: 'No valid transactions found.' };
+    }
+
+    return {
+      ok: true,
+      condo_name: condoName,
+      transaction_count: rows.length,
+      median_profitability_pct: medianProfitability,
+      median_annualised_pct: medianAnnualised,
+    };
+  }
+
+  async getCondoSaleProfitabilityByYear(
+    condosCsv?: string,
+  ): Promise<CondoSaleProfitabilityByYearResponse> {
+    const condos = (condosCsv ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 30);
+
+    if (!condos.length) return { ok: false, error: 'Missing condos parameter.' };
+
+    const { data, error } = await this.supabase
+      .from('condo_sale_transactions')
+      .select('condo_name, purchase_price, profit, sale_date')
+      .in('condo_name', condos);
+
+    if (error) return { ok: false, error: error.message };
+
+    const rows = (data ?? []) as Array<{
+      condo_name: unknown;
+      purchase_price: unknown;
+      profit: unknown;
+      sale_date: unknown;
+    }>;
+
+    // condo -> year -> profit%[]
+    const bucket = new Map<string, Map<number, number[]>>();
+    const yearSet = new Set<number>();
+
+    for (const r of rows) {
+      const condoName = typeof r.condo_name === 'string' ? r.condo_name : '';
+      if (!condoName) continue;
+
+      const purchasePrice =
+        r.purchase_price == null ? NaN : Number(r.purchase_price);
+      const profit = r.profit == null ? NaN : Number(r.profit);
+
+      const saleDate =
+        typeof r.sale_date === 'string' ? new Date(r.sale_date) : null;
+      const saleYear =
+        saleDate && Number.isFinite(saleDate.getTime()) ? saleDate.getFullYear() : null;
+
+      if (
+        saleYear === null ||
+        !Number.isFinite(purchasePrice) ||
+        purchasePrice <= 0 ||
+        !Number.isFinite(profit)
+      ) {
+        continue;
+      }
+
+      const pct = (profit / purchasePrice) * 100;
+      yearSet.add(saleYear);
+
+      if (!bucket.has(condoName)) bucket.set(condoName, new Map());
+      const byYear = bucket.get(condoName)!;
+      if (!byYear.has(saleYear)) byYear.set(saleYear, []);
+      byYear.get(saleYear)!.push(pct);
+    }
+
+    const years = [...yearSet].sort((a, b) => a - b);
+    if (!years.length) return { ok: false, error: 'No valid transactions found.' };
+
+    const series = condos.map((condo) => {
+      const byYear = bucket.get(condo) ?? new Map<number, number[]>();
+      const points = years.map((year) => {
+        const arr = byYear.get(year) ?? [];
+        return {
+          year,
+          transaction_count: arr.length,
+          median_profitability_pct: this.median(arr),
+        };
+      });
+      return { condo_name: condo, points };
+    });
+
+    return { ok: true, condos, years, series };
+  }
+
+  async getCondoSaleProfitabilityRows(
+    condosCsv?: string,
+  ): Promise<CondoSaleProfitabilityRowsResponse> {
+    const condos = (condosCsv ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 30);
+
+    if (!condos.length) return { ok: false, error: 'Missing condos parameter.' };
+
+    const { data, error } = await this.supabase
+      .from('condo_sale_transactions')
+      .select('condo_name, unit_type, purchase_price, profit, sale_date')
+      .in('condo_name', condos);
+
+    if (error) return { ok: false, error: error.message };
+
+    const rows = (data ?? []) as Array<{
+      condo_name: unknown;
+      unit_type: unknown;
+      purchase_price: unknown;
+      profit: unknown;
+      sale_date: unknown;
+    }>;
+
+    const out: Array<{
+      condo_name: string;
+      unit_type: string | null;
+      sale_month: string;
+      profitability_pct: number;
+    }> = [];
+
+    for (const r of rows) {
+      const condoName = typeof r.condo_name === 'string' ? r.condo_name : '';
+      if (!condoName) continue;
+
+      const unitType = typeof r.unit_type === 'string' ? r.unit_type : null;
+      const purchasePrice =
+        r.purchase_price == null ? NaN : Number(r.purchase_price);
+      const profit = r.profit == null ? NaN : Number(r.profit);
+
+      const saleDate =
+        typeof r.sale_date === 'string' ? new Date(r.sale_date) : null;
+      const saleMonth =
+        saleDate && Number.isFinite(saleDate.getTime())
+          ? `${saleDate.getFullYear()}-${String(saleDate.getMonth() + 1).padStart(2, '0')}`
+          : null;
+
+      if (
+        saleMonth === null ||
+        !Number.isFinite(purchasePrice) ||
+        purchasePrice <= 0 ||
+        !Number.isFinite(profit)
+      ) {
+        continue;
+      }
+
+      out.push({
+        condo_name: condoName,
+        unit_type: unitType,
+        sale_month: saleMonth,
+        profitability_pct: (profit / purchasePrice) * 100,
+      });
+    }
+
+    if (!out.length) return { ok: false, error: 'No valid transactions found.' };
+    return { ok: true, condos, rows: out };
+  }
 
   sendMarketOutlook2026(body: SendMarketOutlook2026Request) {
     const email = (body.email ?? '').trim().toLowerCase();

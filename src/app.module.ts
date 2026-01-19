@@ -8,6 +8,7 @@ import { SupabaseModule } from './supabase/supabase.module';
 import { FaviconController } from './favicon.controller';
 import { LeadsModule } from './leads/leads.module';
 import { ReportsModule } from './reports/reports.module';
+import { AdminModule } from './admin/admin.module';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { ReportsModule } from './reports/reports.module';
     ReviewPlanModule,
     LeadsModule,
     ReportsModule,
+    AdminModule,
   ],
   controllers: [AppController, FaviconController],
   providers: [AppService],
