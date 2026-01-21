@@ -2,6 +2,7 @@ export type CondoSaleTransaction = {
   id: string;
   condo_name: string;
   unit_type: string;
+  sqft: number | null;
   purchase_date: string | null; // YYYY-MM-DD
   purchase_price: number | null;
   sale_date: string | null; // YYYY-MM-DD
@@ -29,6 +30,7 @@ export type UpsertCondoSaleTransactionRequest = Partial<{
   id: string;
   condo_name: string;
   unit_type: string;
+  sqft: number;
   purchase_date: string; // YYYY-MM-DD
   purchase_price: number;
   sale_date: string; // YYYY-MM-DD

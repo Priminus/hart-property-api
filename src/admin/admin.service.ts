@@ -143,6 +143,7 @@ export class AdminService {
     } as Partial<CondoSaleTransaction> & {
       condo_name?: unknown;
       unit_type?: unknown;
+      sqft?: unknown;
       purchase_date?: unknown;
       purchase_price?: unknown;
       sale_date?: unknown;
@@ -157,6 +158,7 @@ export class AdminService {
       typeof merged.unit_type === 'string' && merged.unit_type.trim()
         ? merged.unit_type.trim()
         : null;
+    const sqft = asNum(merged.sqft);
     const purchase_date =
       merged.purchase_date == null || merged.purchase_date === ''
         ? null
@@ -175,6 +177,9 @@ export class AdminService {
     }
     if (merged.sale_date != null && merged.sale_date !== '' && !sale_date) {
       return { ok: false, error: 'sale_date must be YYYY-MM-DD.' };
+    }
+    if (sqft != null && sqft <= 0) {
+      return { ok: false, error: 'sqft must be a positive number.' };
     }
     if (purchase_price != null && purchase_price <= 0) {
       return { ok: false, error: 'purchase_price must be a positive number.' };
@@ -205,6 +210,7 @@ export class AdminService {
       ...(id ? { id } : {}),
       condo_name,
       unit_type,
+      sqft,
       purchase_date,
       purchase_price,
       sale_date,
