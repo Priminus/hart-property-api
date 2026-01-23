@@ -3,6 +3,10 @@ export type CondoSaleTransaction = {
   condo_name: string;
   unit_type: string;
   sqft: number | null;
+  exact_level: number | null;
+  // NOTE: exact_unit is intentionally NEVER exposed via API
+  level_low: number | null;
+  level_high: number | null;
   purchase_date: string | null; // YYYY-MM-DD
   purchase_price: number | null;
   sale_date: string | null; // YYYY-MM-DD
@@ -31,6 +35,10 @@ export type UpsertCondoSaleTransactionRequest = Partial<{
   condo_name: string;
   unit_type: string;
   sqft: number;
+  exact_level: number;
+  exact_unit: number; // Stored but NEVER returned in responses
+  level_low: number;
+  level_high: number;
   purchase_date: string; // YYYY-MM-DD
   purchase_price: number;
   sale_date: string; // YYYY-MM-DD

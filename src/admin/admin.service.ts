@@ -113,9 +113,17 @@ export class AdminService {
       ? await q.eq('condo_name', condoName)
       : await q;
     if (error) return { ok: false, error: error.message };
+
+    // GUARDRAIL: Never expose exact_unit in API responses
+    const safeRows = (data ?? []).map((row) => {
+      const safe = { ...row } as Record<string, unknown>;
+      delete safe.exact_unit;
+      return safe as CondoSaleTransaction;
+    });
+
     return {
       ok: true,
-      rows: (data ?? []) as CondoSaleTransaction[],
+      rows: safeRows,
       total_count: typeof count === 'number' ? count : 0,
       limit: safeLimit,
       offset: safeOffset,
@@ -144,6 +152,10 @@ export class AdminService {
       condo_name?: unknown;
       unit_type?: unknown;
       sqft?: unknown;
+      exact_level?: unknown;
+      exact_unit?: unknown;
+      level_low?: unknown;
+      level_high?: unknown;
       purchase_date?: unknown;
       purchase_price?: unknown;
       sale_date?: unknown;
@@ -159,6 +171,10 @@ export class AdminService {
         ? merged.unit_type.trim()
         : null;
     const sqft = asNum(merged.sqft);
+    const exact_level = asNum(merged.exact_level);
+    const exact_unit = asNum(merged.exact_unit);
+    const level_low = asNum(merged.level_low);
+    const level_high = asNum(merged.level_high);
     const purchase_date =
       merged.purchase_date == null || merged.purchase_date === ''
         ? null
@@ -211,6 +227,10 @@ export class AdminService {
       condo_name,
       unit_type,
       sqft,
+      exact_level,
+      exact_unit, // stored but NEVER returned
+      level_low,
+      level_high,
       purchase_date,
       purchase_price,
       sale_date,
@@ -226,7 +246,12 @@ export class AdminService {
       .single();
 
     if (error) return { ok: false, error: error.message };
-    return { ok: true, row: data as CondoSaleTransaction };
+
+    // GUARDRAIL: Never expose exact_unit in API responses
+    const safeRow = { ...data } as Record<string, unknown>;
+    delete safeRow.exact_unit;
+
+    return { ok: true, row: safeRow as CondoSaleTransaction };
   }
 
   async listListings({

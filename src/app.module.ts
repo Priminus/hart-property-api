@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { ArticlesModule } from './articles/articles.module';
@@ -9,9 +10,12 @@ import { FaviconController } from './favicon.controller';
 import { LeadsModule } from './leads/leads.module';
 import { ReportsModule } from './reports/reports.module';
 import { AdminModule } from './admin/admin.module';
+import { UraModule } from './ura/ura.module';
+import { ValuationModule } from './valuation/valuation.module';
 
 @Module({
   imports: [
+    ScheduleModule.forRoot(),
     SupabaseModule,
     ArticlesModule,
     ListingsModule,
@@ -19,6 +23,8 @@ import { AdminModule } from './admin/admin.module';
     LeadsModule,
     ReportsModule,
     AdminModule,
+    UraModule,
+    ValuationModule,
   ],
   controllers: [AppController, FaviconController],
   providers: [AppService],
