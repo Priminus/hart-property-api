@@ -142,12 +142,12 @@ export class ValuationService {
   }
 
   /**
-   * Determine unit type (e.g., "2BR", "3BR") from sqft by looking at DB
+   * Determine unit type and its sqft range from input sqft
    */
-  private async determineUnitType(
+  private async getUnitTypeRange(
     condoName: string,
     sqft: number,
-  ): Promise<string | null> {
+  ): Promise<{ type: string; min: number; max: number } | null> {
     // Get unit types and their sqft ranges for this condo
     const { data } = await this.supabase
       .from('condo_sale_transactions')
@@ -175,7 +175,7 @@ export class ValuationService {
     for (const [type, range] of Object.entries(typeRanges)) {
       const tolerance = (range.max - range.min) * 0.1 || 50; // 10% of range or 50sqft min
       if (sqft >= range.min - tolerance && sqft <= range.max + tolerance) {
-        return type;
+        return { type, min: range.min, max: range.max };
       }
     }
 
@@ -196,27 +196,39 @@ export class ValuationService {
     const floorRange = this.getFloorRange(floor);
     const today = new Date();
 
-    // Define sqft range for similar units (±15%) - use integers for DB query
-    const sqftLow = Math.floor(unitSqft * 0.85);
-    const sqftHigh = Math.ceil(unitSqft * 1.15);
+    // Step 1: Determine what unit type this sqft belongs to (e.g., 678 sqft → 2BR)
+    const unitTypeInfo = await this.getUnitTypeRange(condoName, unitSqft);
 
-    // First, get ALL transactions for this sqft range (no time limit) to find same-floor data
-    const { data: allTimeTxns, error: allTimeError } = await this.supabase
+    // Define sqft range: use unit type range if found, otherwise fallback to ±15%
+    let sqftLow: number;
+    let sqftHigh: number;
+    if (unitTypeInfo) {
+      sqftLow = unitTypeInfo.min;
+      sqftHigh = unitTypeInfo.max;
+    } else {
+      sqftLow = Math.floor(unitSqft * 0.85);
+      sqftHigh = Math.ceil(unitSqft * 1.15);
+    }
+
+    // Step 2: Get recent transactions (last 2 years) for this unit type
+    const twoYearsAgo = new Date();
+    twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+    const minSaleMonth =
+      twoYearsAgo.getFullYear() * 100 + (twoYearsAgo.getMonth() + 1);
+
+    const { data: recentUnitTypeTxns, error: recentError } = await this.supabase
       .from('condo_sale_transactions')
       .select('sale_price, sale_date, level_low, level_high, sqft, unit_type')
       .ilike('condo_name', condoName)
+      .gte('sale_month', minSaleMonth)
       .gte('sqft', sqftLow)
       .lte('sqft', sqftHigh)
       .not('sale_price', 'is', null)
       .not('sqft', 'is', null)
       .order('sale_date', { ascending: false });
 
-    if (allTimeError || !allTimeTxns || allTimeTxns.length === 0) {
-      return null;
-    }
-
-    // Filter to same floor range
-    const sameFloorAllTime = allTimeTxns.filter(
+    // Filter recent to same floor range
+    const recentSameFloor = (recentUnitTypeTxns || []).filter(
       (t) =>
         t.level_low !== null &&
         t.level_high !== null &&
@@ -224,35 +236,71 @@ export class ValuationService {
         t.level_high >= floorRange.low,
     );
 
-    // Get recent transactions (last 3 years) for appreciation calculation
-    const threeYearsAgo = new Date();
-    threeYearsAgo.setFullYear(threeYearsAgo.getFullYear() - 3);
+    // Step 3: If we have enough recent same-floor data (≥3), use it
+    // Otherwise, fall back to older data
+    let allMatchingTxns: typeof recentUnitTypeTxns;
+    let appreciationRate: number;
 
-    const recentTxnsForAppreciation = allTimeTxns.filter((t) => {
-      const saleDate = new Date(t.sale_date as string);
-      return saleDate >= threeYearsAgo;
-    });
+    if (recentSameFloor.length >= 3) {
+      // Great! We have recent same-floor data
+      allMatchingTxns = recentSameFloor;
+      appreciationRate = this.calculateAppreciationRate(
+        recentSameFloor.map((t) => ({
+          sale_price: t.sale_price as number,
+          sale_date: t.sale_date as string,
+          sqft: t.sqft as number,
+        })),
+      );
+    } else if ((recentUnitTypeTxns || []).length >= 3) {
+      // Use recent data from any floor
+      allMatchingTxns = recentUnitTypeTxns;
+      appreciationRate = this.calculateAppreciationRate(
+        (recentUnitTypeTxns || []).map((t) => ({
+          sale_price: t.sale_price as number,
+          sale_date: t.sale_date as string,
+          sqft: t.sqft as number,
+        })),
+      );
+    } else {
+      // Fall back to all-time data
+      const { data: allTimeTxns } = await this.supabase
+        .from('condo_sale_transactions')
+        .select('sale_price, sale_date, level_low, level_high, sqft, unit_type')
+        .ilike('condo_name', condoName)
+        .gte('sqft', sqftLow)
+        .lte('sqft', sqftHigh)
+        .not('sale_price', 'is', null)
+        .not('sqft', 'is', null)
+        .order('sale_date', { ascending: false });
 
-    // Calculate market appreciation rate from recent transactions of similar size
-    const txnsForAppreciation =
-      recentTxnsForAppreciation.length >= 3 ? recentTxnsForAppreciation : allTimeTxns;
-    const appreciationRate = this.calculateAppreciationRate(
-      txnsForAppreciation.map((t) => ({
-        sale_price: t.sale_price as number,
-        sale_date: t.sale_date as string,
-        sqft: t.sqft as number,
-      })),
-    );
+      if (!allTimeTxns || allTimeTxns.length === 0) {
+        return null;
+      }
 
-    // Priority: same floor transactions (even if older), then any similar sqft
-    // Use same-floor if we have at least 1, otherwise fall back to similar sqft
-    const allMatchingTxns =
-      sameFloorAllTime.length >= 1 ? sameFloorAllTime : allTimeTxns;
+      // Prefer same-floor even if old
+      const sameFloorAllTime = allTimeTxns.filter(
+        (t) =>
+          t.level_low !== null &&
+          t.level_high !== null &&
+          t.level_low <= floorRange.high &&
+          t.level_high >= floorRange.low,
+      );
 
-    // Split into recent (<2 years) and older (2+ years) transactions
-    const twoYearsAgo = new Date();
-    twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+      allMatchingTxns = sameFloorAllTime.length >= 1 ? sameFloorAllTime : allTimeTxns;
+      appreciationRate = this.calculateAppreciationRate(
+        allTimeTxns.map((t) => ({
+          sale_price: t.sale_price as number,
+          sale_date: t.sale_date as string,
+          sqft: t.sqft as number,
+        })),
+      );
+    }
 
+    if (!allMatchingTxns || allMatchingTxns.length === 0) {
+      return null;
+    }
+
+    // Filter to recent transactions only (for weighted average if enough data)
     const recentOnlyTxns = allMatchingTxns.filter((t) => {
       const saleDate = new Date(t.sale_date as string);
       return saleDate >= twoYearsAgo;
@@ -322,8 +370,17 @@ export class ValuationService {
     // Store which transactions we used for display
     const finalTxns = recentOnlyTxns.length >= 3 ? recentOnlyTxns : allMatchingTxns;
 
-    // Apply floor adjustment if using different floor data
-    if (sameFloorAllTime.length < 1 && finalTxns.length > 0) {
+    // Check if we're using same-floor data
+    const usingSameFloor = finalTxns.some(
+      (t) =>
+        t.level_low !== null &&
+        t.level_high !== null &&
+        t.level_low <= floorRange.high &&
+        t.level_high >= floorRange.low,
+    );
+
+    // Apply floor adjustment if NOT using same-floor data
+    if (!usingSameFloor && finalTxns.length > 0) {
       const avgFloorInData =
         finalTxns.reduce((sum, t) => {
           const mid = ((t.level_low ?? 10) + (t.level_high ?? 10)) / 2;
@@ -344,7 +401,7 @@ export class ValuationService {
     const estimatedPriceHigh = Math.round(estimatedPsfHigh * unitSqft);
 
     // Format recent transactions for display
-    const recentTxns = finalTxns.slice(0, 10).map((t) => {
+    const displayTxns = finalTxns.slice(0, 10).map((t) => {
       const sqft = t.sqft as number | null;
       const price = t.sale_price as number;
       const rawPsf = sqft ? Math.round(price / sqft) : null;
@@ -392,7 +449,7 @@ export class ValuationService {
       estimated_price_low: estimatedPriceLow,
       estimated_price_mid: estimatedPriceMid,
       estimated_price_high: estimatedPriceHigh,
-      recent_transactions: recentTxns,
+      recent_transactions: displayTxns,
       data_period: `${formatDate(oldestDate)} - ${formatDate(newestDate)}`,
       generated_at: new Date().toISOString(),
     };
