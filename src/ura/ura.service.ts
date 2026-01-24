@@ -86,20 +86,48 @@ export class UraService {
   }
 
   /**
+   * Helper to fetch with retry logic
+   */
+  private async fetchWithRetry(
+    url: string,
+    options: RequestInit,
+    retries = 3,
+    backoff = 2000,
+  ): Promise<Response> {
+    for (let i = 0; i < retries; i++) {
+      try {
+        const res = await fetch(url, options);
+        if (res.ok) return res;
+        
+        // If it's a rate limit or server error, we retry
+        if (res.status === 429 || res.status >= 500) {
+          this.logger.warn(`Fetch failed with status ${res.status}. Retry ${i + 1}/${retries}...`);
+        } else {
+          // Other errors might not benefit from retry, but let's be safe
+          this.logger.warn(`Fetch failed with status ${res.status}. Retry ${i + 1}/${retries}...`);
+        }
+      } catch (err) {
+        this.logger.error(`Fetch attempt ${i + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
+        if (i === retries - 1) throw err;
+      }
+      
+      // Wait before retry
+      await new Promise(resolve => setTimeout(resolve, backoff * (i + 1)));
+    }
+    throw new Error(`Failed to fetch after ${retries} retries: ${url}`);
+  }
+
+  /**
    * Get daily token from URA API
    */
   private async getToken(): Promise<string> {
     const apiKey = process.env.URA_API_KEY;
     if (!apiKey) throw new Error('URA_API_KEY not configured');
 
-    const res = await fetch(
+    const res = await this.fetchWithRetry(
       'https://eservice.ura.gov.sg/uraDataService/insertNewToken/v1',
       { headers: { AccessKey: apiKey } },
     );
-
-    if (!res.ok) {
-      throw new Error(`Failed to get URA token: ${res.status}`);
-    }
 
     const data = (await res.json()) as { Status: string; Result: string };
     if (data.Status !== 'Success') {
@@ -120,13 +148,9 @@ export class UraService {
     const apiKey = process.env.URA_API_KEY;
     const url = `https://eservice.ura.gov.sg/uraDataService/invokeUraDS/v1?service=PMI_Resi_Transaction&batch=${batch}`;
 
-    const res = await fetch(url, {
+    const res = await this.fetchWithRetry(url, {
       headers: { AccessKey: apiKey!, Token: token },
     });
-
-    if (!res.ok) {
-      throw new Error(`Failed to fetch URA batch ${batch}: ${res.status}`);
-    }
 
     const data = (await res.json()) as UraApiResponse;
     if (data.Status !== 'Success') {

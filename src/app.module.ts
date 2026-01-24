@@ -12,6 +12,7 @@ import { ReportsModule } from './reports/reports.module';
 import { AdminModule } from './admin/admin.module';
 import { UraModule } from './ura/ura.module';
 import { ValuationModule } from './valuation/valuation.module';
+import { MarketModule } from './market/market.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { ValuationModule } from './valuation/valuation.module';
     AdminModule,
     UraModule,
     ValuationModule,
+    MarketModule,
   ],
   controllers: [AppController, FaviconController],
   providers: [AppService],
