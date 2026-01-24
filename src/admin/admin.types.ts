@@ -1,6 +1,7 @@
-export type CondoSaleTransaction = {
+export type SaleTransaction = {
   id: string;
   condo_name: string;
+  property_type: string | null;
   unit_type: string;
   sqft: number | null;
   exact_level: number | null;
@@ -16,10 +17,10 @@ export type CondoSaleTransaction = {
   created_at: string;
 };
 
-export type ListCondoSaleTransactionsResponse =
+export type ListSaleTransactionsResponse =
   | {
       ok: true;
-      rows: CondoSaleTransaction[];
+      rows: SaleTransaction[];
       total_count: number;
       limit: number;
       offset: number;
@@ -30,13 +31,14 @@ export type ListCondoNamesResponse =
   | { ok: true; condos: string[] }
   | { ok: false; error: string };
 
-export type UpsertCondoSaleTransactionRequest = Partial<{
+export type UpsertSaleTransactionRequest = Partial<{
   id: string;
   condo_name: string;
+  property_type: string | null;
   unit_type: string;
   sqft: number;
   exact_level: number;
-  exact_unit: number; // Stored but NEVER returned in responses
+  exact_unit: string; // Stored but NEVER returned in responses
   level_low: number;
   level_high: number;
   purchase_date: string; // YYYY-MM-DD
@@ -45,8 +47,8 @@ export type UpsertCondoSaleTransactionRequest = Partial<{
   sale_price: number;
 }>;
 
-export type UpsertCondoSaleTransactionResponse =
-  | { ok: true; row: CondoSaleTransaction }
+export type UpsertSaleTransactionResponse =
+  | { ok: true; row: SaleTransaction }
   | { ok: false; error: string };
 
 export type Listing = {
@@ -96,4 +98,3 @@ export type UpsertListingRequest = Partial<{
 export type UpsertListingResponse =
   | { ok: true; row: Listing }
   | { ok: false; error: string };
-

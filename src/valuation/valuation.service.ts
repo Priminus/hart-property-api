@@ -150,7 +150,7 @@ export class ValuationService {
   ): Promise<{ type: string; min: number; max: number } | null> {
     // Get unit types and their sqft ranges for this condo
     const { data } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('unit_type, sqft')
       .ilike('condo_name', condoName)
       .not('unit_type', 'is', null)
@@ -217,7 +217,7 @@ export class ValuationService {
       twoYearsAgo.getFullYear() * 100 + (twoYearsAgo.getMonth() + 1);
 
     const { data: recentUnitTypeTxns, error: recentError } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('sale_price, sale_date, level_low, level_high, sqft, unit_type')
       .ilike('condo_name', condoName)
       .gte('sale_month', minSaleMonth)
@@ -264,7 +264,7 @@ export class ValuationService {
     } else {
       // Fall back to all-time data
       const { data: allTimeTxns } = await this.supabase
-        .from('condo_sale_transactions')
+        .from('sale_transactions')
         .select('sale_price, sale_date, level_low, level_high, sqft, unit_type')
         .ilike('condo_name', condoName)
         .gte('sqft', sqftLow)
@@ -677,7 +677,7 @@ michael.hart@hartproperty.sg
   async requestValuation(req: ValuationRequest): Promise<ValuationResponse> {
     const email = req.email?.trim().toLowerCase();
     const condoName = req.condo_name?.trim();
-    const unitNumber = req.unit_number?.trim();
+    const unitNumber = req.unit_number?.trim() || undefined;
     const sqft = req.sqft;
 
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -686,20 +686,34 @@ michael.hart@hartproperty.sg
     if (!condoName) {
       return { ok: false, error: 'Condo name is required.' };
     }
-    if (!unitNumber) {
-      return { ok: false, error: 'Unit number is required.' };
-    }
     if (!sqft || sqft <= 0) {
       return { ok: false, error: 'Unit size (sqft) is required.' };
     }
 
-    console.log('[Valuation] Request received', { email, condoName, unitNumber, sqft });
+    // Check if property has floor data (condo vs landed)
+    const hasFloor = await this.hasFloorData(condoName);
 
-    // Calculate valuation
-    const valuation = await this.calculateValuation(condoName, unitNumber, sqft);
+    // Require unit number only for condos (properties with floor data)
+    if (hasFloor && !unitNumber) {
+      return { ok: false, error: 'Unit number is required for this property.' };
+    }
+
+    console.log('[Valuation] Request received', {
+      email,
+      condoName,
+      unitNumber: unitNumber || '(landed)',
+      sqft,
+    });
+
+    // Calculate valuation - use a default "floor" for landed properties
+    const valuation = await this.calculateValuation(
+      condoName,
+      unitNumber || '1', // For landed, use floor 1 as placeholder
+      sqft,
+    );
 
     // Store lead regardless of valuation result
-    await this.storeLead(email, req.name, condoName, unitNumber, valuation);
+    await this.storeLead(email, req.name, condoName, unitNumber || '', valuation);
 
     if (!valuation) {
       // Still send a "we'll review" email if no data available
@@ -710,7 +724,7 @@ michael.hart@hartproperty.sg
       return {
         ok: true,
         message:
-          'Thank you! We have limited transaction data for this property. Michael will personally review and send you a valuation within 24 hours.',
+          'We have limited transaction data for this property. Michael will personally review and send you a valuation within 24 hours.',
       };
     }
 
@@ -730,69 +744,63 @@ michael.hart@hartproperty.sg
   }
 
   /**
-   * Get list of condo names for autocomplete
+   * Search condo names for autocomplete (debounced, called as user types)
    */
-  async getCondoNames(): Promise<string[]> {
-    const { data } = await this.supabase
-      .from('condo_sale_transactions')
+  async searchCondoNames(query: string): Promise<string[]> {
+    if (!query || query.trim().length < 2) {
+      return [];
+    }
+
+    const searchTerm = query.trim().toLowerCase();
+
+    // Use ilike for case-insensitive pattern matching
+    const { data, error } = await this.supabase
+      .from('sale_transactions')
       .select('condo_name')
       .not('condo_name', 'is', null)
-      .not('sale_price', 'is', null);
+      .not('sale_price', 'is', null)
+      .ilike('condo_name', `%${searchTerm}%`)
+      .limit(1000);
+
+    if (error) {
+      console.error('[Valuation] Failed to search condo names:', error.message);
+      return [];
+    }
 
     if (!data) return [];
 
-    // Get unique names, sorted
-    const names = [...new Set(data.map((r) => r.condo_name as string))];
-    names.sort((a, b) => a.localeCompare(b));
-    return names;
+    // Get unique names (case-insensitive dedup), sorted, limit to 20 for dropdown
+    const seen = new Map<string, string>(); // lowercase -> original
+    for (const r of data) {
+      const name = (r.condo_name as string).trim();
+      const key = name.toLowerCase();
+      if (!seen.has(key)) {
+        seen.set(key, name);
+      }
+    }
+    const names = [...seen.values()];
+    names.sort((a, b) =>
+      a.localeCompare(b, undefined, { sensitivity: 'base' }),
+    );
+    return names.slice(0, 20);
   }
 
   /**
-   * Parse unit number to extract floor and unit separately
-   * e.g. "12-05" -> { floor: 12, unit: "05" }
-   * e.g. "#03-08" -> { floor: 3, unit: "08" }
-   */
-  private parseUnitNumber(unitNumber: string): { floor: number; unit: string } | null {
-    const cleaned = unitNumber.replace(/^#/, '').trim();
-
-    // Format: "12-05" or "12 - 05"
-    const dashMatch = cleaned.match(/^(\d+)\s*-\s*(\d+)$/);
-    if (dashMatch) {
-      return {
-        floor: parseInt(dashMatch[1], 10),
-        unit: dashMatch[2],
-      };
-    }
-
-    // Format: "1205" (4 digits, first 2 are floor, last 2 are unit)
-    if (/^\d{4}$/.test(cleaned)) {
-      return {
-        floor: parseInt(cleaned.substring(0, 2), 10),
-        unit: cleaned.substring(2),
-      };
-    }
-
-    return null;
-  }
-
-  /**
-   * Get exact unit sqft from DB if we have that specific unit
+   * Get exact unit sqft from DB using separate floor and unit values
    * Returns null if not found
    */
-  async getExactUnitSqft(
+  async getExactUnitSqftByFloorUnit(
     condoName: string,
-    unitNumber: string,
+    floor: number,
+    unit: string,
   ): Promise<number | null> {
-    const parsed = this.parseUnitNumber(unitNumber);
-    if (!parsed) return null;
-
     // Try to find exact match with exact_level and exact_unit
     const { data: exactMatch } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('sqft')
       .ilike('condo_name', condoName)
-      .eq('exact_level', parsed.floor)
-      .eq('exact_unit', parsed.unit)
+      .eq('exact_level', floor)
+      .eq('exact_unit', unit)
       .not('sqft', 'is', null)
       .order('sale_date', { ascending: false })
       .limit(1);
@@ -804,11 +812,11 @@ michael.hart@hartproperty.sg
     // Also try matching just the floor within level_low/level_high range
     // and sqft for that floor range (if only one sqft exists for that floor)
     const { data: floorMatch } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('sqft')
       .ilike('condo_name', condoName)
-      .lte('level_low', parsed.floor)
-      .gte('level_high', parsed.floor)
+      .lte('level_low', floor)
+      .gte('level_high', floor)
       .not('sqft', 'is', null);
 
     if (floorMatch && floorMatch.length > 0) {
@@ -821,5 +829,21 @@ michael.hart@hartproperty.sg
     }
 
     return null;
+  }
+
+  /**
+   * Check if a property has floor data (level_low/level_high)
+   * Returns true for condos/apartments, false for landed properties
+   */
+  async hasFloorData(condoName: string): Promise<boolean> {
+    const { data } = await this.supabase
+      .from('sale_transactions')
+      .select('level_low, level_high')
+      .ilike('condo_name', condoName)
+      .not('level_low', 'is', null)
+      .not('level_high', 'is', null)
+      .limit(1);
+
+    return data !== null && data.length > 0;
   }
 }

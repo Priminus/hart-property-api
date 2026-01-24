@@ -22,7 +22,7 @@ export class MarketService {
 
     // Fetch all transactions for this condo, sorted by date descending
     const { data: txns, error } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('sale_price, sqft, sale_date')
       .ilike('condo_name', condoName)
       .not('sale_price', 'is', null)

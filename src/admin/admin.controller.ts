@@ -10,10 +10,10 @@ import {
 import { AdminService } from './admin.service';
 import type {
   ListCondoNamesResponse,
-  ListCondoSaleTransactionsResponse,
+  ListSaleTransactionsResponse,
   ListListingsResponse,
-  UpsertCondoSaleTransactionRequest,
-  UpsertCondoSaleTransactionResponse,
+  UpsertSaleTransactionRequest,
+  UpsertSaleTransactionResponse,
   UpsertListingRequest,
   UpsertListingResponse,
 } from './admin.types';
@@ -37,10 +37,10 @@ export class AdminController {
     @Query('condo') condo?: string,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
-  ): Promise<ListCondoSaleTransactionsResponse> {
+  ): Promise<ListSaleTransactionsResponse> {
     const email = await this.service.requireLoggedInUserEmail(authorization);
     if (!email) throw new UnauthorizedException('Unauthorized.');
-    return this.service.listCondoSaleTransactions({
+    return this.service.listSaleTransactions({
       condo,
       limit: limit ? Number(limit) : undefined,
       offset: offset ? Number(offset) : undefined,
@@ -50,11 +50,11 @@ export class AdminController {
   @Post('property-transactions')
   async upsert(
     @Headers('authorization') authorization: string | undefined,
-    @Body() body: UpsertCondoSaleTransactionRequest,
-  ): Promise<UpsertCondoSaleTransactionResponse> {
+    @Body() body: UpsertSaleTransactionRequest,
+  ): Promise<UpsertSaleTransactionResponse> {
     const email = await this.service.requireLoggedInUserEmail(authorization);
     if (!email) throw new UnauthorizedException('Unauthorized.');
-    return this.service.upsertCondoSaleTransaction(body);
+    return this.service.upsertSaleTransaction(body);
   }
 
   @Get('listings')
@@ -81,4 +81,3 @@ export class AdminController {
     return this.service.upsertListing(body);
   }
 }
-

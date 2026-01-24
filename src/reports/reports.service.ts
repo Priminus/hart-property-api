@@ -35,7 +35,7 @@ export class ReportsService {
     if (!condoName) return { ok: false, error: 'Missing condo parameter.' };
 
     const { data, error } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select(
         'condo_name, purchase_price, profit, annualised_pct, purchase_date, sale_date, sale_price',
       )
@@ -122,7 +122,7 @@ export class ReportsService {
     if (!condos.length) return { ok: false, error: 'Missing condos parameter.' };
 
     const { data, error } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('condo_name, purchase_price, profit, sale_date')
       .in('condo_name', condos);
 
@@ -201,7 +201,7 @@ export class ReportsService {
     if (!condos.length) return { ok: false, error: 'Missing condos parameter.' };
 
     const { data, error } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('condo_name, unit_type, purchase_price, profit, sale_date')
       .in('condo_name', condos);
 

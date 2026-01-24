@@ -2,10 +2,10 @@ import { Inject, Injectable } from '@nestjs/common';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { SUPABASE_CLIENT } from '../supabase/supabase.constants';
 import type {
-  CondoSaleTransaction,
-  ListCondoSaleTransactionsResponse,
-  UpsertCondoSaleTransactionRequest,
-  UpsertCondoSaleTransactionResponse,
+  SaleTransaction,
+  ListSaleTransactionsResponse,
+  UpsertSaleTransactionRequest,
+  UpsertSaleTransactionResponse,
   ListListingsResponse,
   Listing,
   UpsertListingRequest,
@@ -74,7 +74,7 @@ export class AdminService {
 
   async listCondoNames() {
     const { data, error } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('condo_name')
       .order('condo_name', { ascending: true })
       .limit(1000);
@@ -88,7 +88,7 @@ export class AdminService {
     return { ok: true as const, condos: uniq };
   }
 
-  async listCondoSaleTransactions({
+  async listSaleTransactions({
     condo,
     limit,
     offset,
@@ -96,14 +96,14 @@ export class AdminService {
     condo?: string;
     limit?: number;
     offset?: number;
-  }): Promise<ListCondoSaleTransactionsResponse> {
+  }): Promise<ListSaleTransactionsResponse> {
     const condoName = (condo ?? '').trim();
 
     const safeLimit = Math.min(100, Math.max(1, Number.isFinite(limit ?? NaN) ? (limit as number) : 20));
     const safeOffset = Math.max(0, Number.isFinite(offset ?? NaN) ? (offset as number) : 0);
 
     const q = this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('*', { count: 'exact' })
       .order('sale_date', { ascending: false })
       .order('created_at', { ascending: false })
@@ -118,7 +118,7 @@ export class AdminService {
     const safeRows = (data ?? []).map((row) => {
       const safe = { ...row } as Record<string, unknown>;
       delete safe.exact_unit;
-      return safe as CondoSaleTransaction;
+      return safe as SaleTransaction;
     });
 
     return {
@@ -130,26 +130,27 @@ export class AdminService {
     };
   }
 
-  async upsertCondoSaleTransaction(
-    body: UpsertCondoSaleTransactionRequest,
-  ): Promise<UpsertCondoSaleTransactionResponse> {
+  async upsertSaleTransaction(
+    body: UpsertSaleTransactionRequest,
+  ): Promise<UpsertSaleTransactionResponse> {
     const id = typeof body.id === 'string' && body.id.trim() ? body.id.trim() : undefined;
-    let base: Partial<CondoSaleTransaction> = {};
+    let base: Partial<SaleTransaction> = {};
     if (id) {
       const { data } = await this.supabase
-        .from('condo_sale_transactions')
+        .from('sale_transactions')
         .select('*')
         .eq('id', id)
         .maybeSingle();
-      base = (data ?? {}) as Partial<CondoSaleTransaction>;
+      base = (data ?? {}) as Partial<SaleTransaction>;
     }
 
     const merged = {
       ...base,
       ...body,
       id: id ?? (base.id as string | undefined),
-    } as Partial<CondoSaleTransaction> & {
+    } as Partial<SaleTransaction> & {
       condo_name?: unknown;
+      property_type?: unknown;
       unit_type?: unknown;
       sqft?: unknown;
       exact_level?: unknown;
@@ -166,13 +167,17 @@ export class AdminService {
       typeof merged.condo_name === 'string' && merged.condo_name.trim()
         ? merged.condo_name.trim()
         : null;
+    const property_type =
+      typeof merged.property_type === 'string' && merged.property_type.trim()
+        ? merged.property_type.trim()
+        : null;
     const unit_type =
       typeof merged.unit_type === 'string' && merged.unit_type.trim()
         ? merged.unit_type.trim()
         : null;
     const sqft = asNum(merged.sqft);
     const exact_level = asNum(merged.exact_level);
-    const exact_unit = asNum(merged.exact_unit);
+    const exact_unit = merged.exact_unit != null ? String(merged.exact_unit).trim() : null;
     const level_low = asNum(merged.level_low);
     const level_high = asNum(merged.level_high);
     const purchase_date =
@@ -225,6 +230,7 @@ export class AdminService {
     const row = {
       ...(id ? { id } : {}),
       condo_name,
+      property_type,
       unit_type,
       sqft,
       exact_level,
@@ -240,7 +246,7 @@ export class AdminService {
     };
 
     const { data, error } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .upsert(row)
       .select('*')
       .single();
@@ -251,7 +257,7 @@ export class AdminService {
     const safeRow = { ...data } as Record<string, unknown>;
     delete safeRow.exact_unit;
 
-    return { ok: true, row: safeRow as CondoSaleTransaction };
+    return { ok: true, row: safeRow as SaleTransaction };
   }
 
   async listListings({
@@ -374,4 +380,3 @@ export class AdminService {
     };
   }
 }
-

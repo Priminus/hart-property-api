@@ -2,7 +2,7 @@
  * URA Property Transaction Ingestion Script
  *
  * Fetches private residential property transactions from URA API
- * and ingests Condominium transactions into condo_sale_transactions DB.
+ * and ingests Condominium transactions into sale_transactions DB.
  *
  * Usage: npm run ingest:ura
  *
@@ -46,7 +46,7 @@ function mapTypeOfSale(code: string): string | null {
  */
 async function buildCondoNameMap(): Promise<Map<string, string>> {
   const { data } = await supabase
-    .from('condo_sale_transactions')
+    .from('sale_transactions')
     .select('condo_name')
     .not('condo_name', 'is', null);
 
@@ -189,9 +189,10 @@ function parseContractDate(contractDate: string): string | null {
 /**
  * Parse floor range to level_low and level_high
  */
-function parseFloorRange(
-  floorRange: string,
-): { level_low: number | null; level_high: number | null } {
+function parseFloorRange(floorRange: string): {
+  level_low: number | null;
+  level_high: number | null;
+} {
   if (!floorRange) return { level_low: null, level_high: null };
 
   // Format is typically "06 - 10" or "01 - 05"
@@ -239,6 +240,7 @@ function transformToDbRow(
 
   return {
     condo_name: condoName,
+    property_type: txn.propertyType,
     unit_type: null,
     sqft,
     sale_date: saleDate,
@@ -271,19 +273,29 @@ async function bulkMergeRows(
     const chunk = rows.slice(i, i + CHUNK_SIZE);
 
     // Call the batch merge function via RPC
-    const { data, error } = await supabase.rpc('merge_ura_transactions_batch', {
+    const response = (await supabase.rpc('merge_ura_transactions_batch', {
       transactions: chunk,
-    });
+    })) as { 
+      data: { merged: number; inserted: number } | null; 
+      error: { message: string } | null 
+    };
+
+    const data = response.data;
+    const error = response.error;
 
     if (error) {
-      console.error(`Chunk ${Math.floor(i / CHUNK_SIZE) + 1} error: ${error.message}`);
+      console.error(
+        `Chunk ${Math.floor(i / CHUNK_SIZE) + 1} error: ${error.message}`,
+      );
       errors += chunk.length;
     } else if (data) {
       totalMerged += data.merged || 0;
       totalInserted += data.inserted || 0;
     }
 
-    console.log(`  Processed ${Math.min(i + CHUNK_SIZE, rows.length)}/${rows.length} rows...`);
+    console.log(
+      `  Processed ${Math.min(i + CHUNK_SIZE, rows.length)}/${rows.length} rows...`,
+    );
   }
 
   return { merged: totalMerged, inserted: totalInserted, errors };
@@ -309,7 +321,19 @@ async function ingestUraTransactions(): Promise<void> {
   // Collect all rows to insert
   const allRows: Record<string, unknown>[] = [];
   let totalFromApi = 0;
-  let totalCondos = 0;
+  let totalResidential = 0;
+
+  const VALID_PROPERTY_TYPES = [
+    'Strata Detached',
+    'Strata Semidetached',
+    'Strata Terrace',
+    'Detached',
+    'Semi-detached',
+    'Terrace',
+    'Apartment',
+    'Condominium',
+    'Executive Condominium',
+  ];
 
   for (let batch = 1; batch <= 4; batch++) {
     console.log(`\nFetching batch ${batch}/4...`);
@@ -318,14 +342,16 @@ async function ingestUraTransactions(): Promise<void> {
     totalFromApi += transactions.length;
     console.log(`Batch ${batch}: ${transactions.length} transactions`);
 
-    // Filter for Condominium and Apartment (both are private residential)
-    const condoTxns = transactions.filter(
-      (txn) => txn.propertyType === 'Condominium' || txn.propertyType === 'Apartment',
+    // Filter for valid residential property types
+    const residentialTxns = transactions.filter((txn) =>
+      VALID_PROPERTY_TYPES.includes(txn.propertyType),
     );
-    console.log(`Batch ${batch}: ${condoTxns.length} condominium transactions`);
-    totalCondos += condoTxns.length;
+    console.log(
+      `Batch ${batch}: ${residentialTxns.length} residential transactions`,
+    );
+    totalResidential += residentialTxns.length;
 
-    for (const txn of condoTxns) {
+    for (const txn of residentialTxns) {
       const row = transformToDbRow(txn, condoNameMap);
       if (row) allRows.push(row);
     }
@@ -337,7 +363,7 @@ async function ingestUraTransactions(): Promise<void> {
 
   console.log('\n=== Ingestion Complete ===');
   console.log(`Total transactions from URA API: ${totalFromApi}`);
-  console.log(`Condominium transactions: ${totalCondos}`);
+  console.log(`Residential transactions: ${totalResidential}`);
   console.log(`Merged with existing: ${merged}`);
   console.log(`Inserted new: ${inserted}`);
   if (errors > 0) console.log(`Errors: ${errors}`);

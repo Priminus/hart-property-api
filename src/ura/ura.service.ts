@@ -68,7 +68,7 @@ export class UraService {
    */
   private async buildCondoNameMap(): Promise<Map<string, string>> {
     const { data } = await this.supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('condo_name')
       .not('condo_name', 'is', null);
 
@@ -238,6 +238,7 @@ export class UraService {
 
     return {
       condo_name: condoName,
+      property_type: txn.propertyType,
       unit_type: null,
       sqft,
       sale_date: saleDate,
@@ -292,7 +293,7 @@ export class UraService {
    */
   async ingestTransactions(): Promise<{
     total: number;
-    condos: number;
+    residential: number;
     inserted: number;
     skipped: number;
   }> {
@@ -309,7 +310,19 @@ export class UraService {
     // Collect all rows
     const allRows: Record<string, unknown>[] = [];
     let total = 0;
-    let totalCondos = 0;
+    let totalResidential = 0;
+
+    const VALID_PROPERTY_TYPES = [
+      'Strata Detached',
+      'Strata Semidetached',
+      'Strata Terrace',
+      'Detached',
+      'Semi-detached',
+      'Terrace',
+      'Apartment',
+      'Condominium',
+      'Executive Condominium',
+    ];
 
     for (let batch = 1; batch <= 4; batch++) {
       this.logger.log(`Fetching batch ${batch}/4...`);
@@ -317,15 +330,15 @@ export class UraService {
       const transactions = await this.fetchBatch(token, batch);
       total += transactions.length;
 
-      const condoTxns = transactions.filter(
-        (t) => t.propertyType === 'Condominium' || t.propertyType === 'Apartment',
+      const residentialTxns = transactions.filter((t) =>
+        VALID_PROPERTY_TYPES.includes(t.propertyType),
       );
       this.logger.log(
-        `Batch ${batch}: ${condoTxns.length}/${transactions.length} condos`,
+        `Batch ${batch}: ${residentialTxns.length}/${transactions.length} residential properties`,
       );
-      totalCondos += condoTxns.length;
+      totalResidential += residentialTxns.length;
 
-      for (const txn of condoTxns) {
+      for (const txn of residentialTxns) {
         const row = this.transformToDbRow(txn, condoNameMap);
         if (row) allRows.push(row);
       }
@@ -336,10 +349,10 @@ export class UraService {
     const { merged, inserted, errors } = await this.bulkMerge(allRows);
 
     this.logger.log(
-      `Ingestion complete: ${total} total, ${totalCondos} condos, ${merged} merged, ${inserted} inserted, ${errors} errors`,
+      `Ingestion complete: ${total} total, ${totalResidential} residential, ${merged} merged, ${inserted} inserted, ${errors} errors`,
     );
 
-    return { total, condos: totalCondos, inserted, skipped: merged };
+    return { total, residential: totalResidential, inserted, skipped: merged };
   }
 
   /**

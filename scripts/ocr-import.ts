@@ -16,7 +16,43 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-async function extractDataFromImage(imagePath: string): Promise<any[]> {
+interface ExtractedTransaction {
+  date: string | null;
+  level: number | null;
+  unit: string | null;
+  unit_type: string | null;
+  property_type: string | null;
+  sqft: number | null;
+  price: number | null;
+  sale_type: string | null;
+}
+
+interface ProcessedTransaction {
+  condo_name: string;
+  condo_name_lower: string;
+  property_type: string | null;
+  sale_date: string;
+  sale_price: number;
+  sale_month: number;
+  sqft: number | null;
+  unit_type: string | null;
+  exact_level: number | null;
+  exact_unit: string | null;
+  type_of_sale: string | null;
+  purchase_price: number | null;
+  purchase_date: string | null;
+  profit: number | null;
+  annualised_pct: number | null;
+}
+
+interface ExtractedData {
+  transactions?: ExtractedTransaction[];
+  rows?: ExtractedTransaction[];
+}
+
+async function extractDataFromImage(
+  imagePath: string,
+): Promise<ExtractedTransaction[]> {
   const base64Image = fs.readFileSync(imagePath, { encoding: 'base64' });
   const extension = path.extname(imagePath).toLowerCase().replace('.', '');
   const mimeType = extension === 'png' ? 'image/png' : 'image/jpeg';
@@ -36,6 +72,7 @@ Each object must have these keys:
 - level: number (integer from the "Level" column)
 - unit: string (the "Unit" number column, e.g., "12" or "05")
 - unit_type: string (e.g., "2BR", "3BR", or null)
+- property_type: string (e.g., "Condominium", "Apartment", "Terrace", etc. from "Property Type" or context)
 - sqft: number (integer from "Area (sqft)" column)
 - price: number (integer from "Price" or "Sale (Price)" column, remove currency and commas)
 - sale_type: string ("New Sale", "Resale", or "Sub Sale" from "Sale Type" column)
@@ -61,11 +98,14 @@ Ignore the street name.`,
 
   const content = response.choices[0].message.content;
   if (!content) return [];
-  
+
   try {
-    const data = JSON.parse(content);
-    return data.transactions || data.rows || (Array.isArray(data) ? data : []);
-  } catch (e) {
+    const data = JSON.parse(content) as ExtractedData | ExtractedTransaction[];
+    if (Array.isArray(data)) {
+      return data;
+    }
+    return data.transactions || data.rows || [];
+  } catch {
     console.error('  Failed to parse JSON:', content);
     return [];
   }
@@ -78,14 +118,20 @@ function parseDate(dateStr: string | null): string | null {
   return d.toISOString().split('T')[0];
 }
 
-async function processTransaction(condoName: string, txn: any) {
+async function processTransaction(
+  condoName: string,
+  txn: ExtractedTransaction,
+): Promise<ProcessedTransaction | null> {
   const saleDate = parseDate(txn.date);
   if (!saleDate || !txn.price) return null;
 
   const salePrice = txn.price;
   const exactLevel = txn.level;
   const exactUnit = txn.unit;
-  const saleMonth = parseInt(saleDate.substring(0, 4) + saleDate.substring(5, 7), 10);
+  const saleMonth = parseInt(
+    saleDate.substring(0, 4) + saleDate.substring(5, 7),
+    10,
+  );
   const condoNameLower = condoName.toLowerCase();
 
   // Resale Logic: Find previous purchase
@@ -96,7 +142,7 @@ async function processTransaction(condoName: string, txn: any) {
 
   if (txn.sale_type === 'Resale' || txn.sale_type === 'Sub Sale') {
     const { data: prevSale } = await supabase
-      .from('condo_sale_transactions')
+      .from('sale_transactions')
       .select('sale_price, sale_date')
       .eq('condo_name_lower', condoNameLower)
       .eq('exact_level', exactLevel)
@@ -107,15 +153,16 @@ async function processTransaction(condoName: string, txn: any) {
       .maybeSingle();
 
     if (prevSale) {
-      purchasePrice = prevSale.sale_price;
-      purchaseDate = prevSale.sale_date;
-      if (purchasePrice !== null) {
+      purchasePrice = prevSale.sale_price as number | null;
+      purchaseDate = prevSale.sale_date as string | null;
+      if (purchasePrice !== null && purchaseDate !== null) {
         profit = salePrice - purchasePrice;
-        const d1 = new Date(purchaseDate!).getTime();
+        const d1 = new Date(purchaseDate).getTime();
         const d2 = new Date(saleDate).getTime();
         const years = (d2 - d1) / (1000 * 60 * 60 * 24 * 365.25);
         if (years > 0) {
-          annualisedPct = (Math.pow(salePrice / purchasePrice, 1 / years) - 1) * 100;
+          annualisedPct =
+            (Math.pow(salePrice / purchasePrice, 1 / years) - 1) * 100;
           annualisedPct = Math.round(annualisedPct * 100) / 100;
         }
       }
@@ -125,6 +172,7 @@ async function processTransaction(condoName: string, txn: any) {
   return {
     condo_name: condoName,
     condo_name_lower: condoNameLower,
+    property_type: txn.property_type || null,
     sale_date: saleDate,
     sale_price: salePrice,
     sale_month: saleMonth,
@@ -150,40 +198,50 @@ async function main() {
   const folderPath = path.resolve(args[0]);
   const condoName = args[1];
   const csvPath = path.join(folderPath, 'extracted_transactions.csv');
-  const files = fs.readdirSync(folderPath).filter(f => 
-    ['.png', '.jpg', '.jpeg'].includes(path.extname(f).toLowerCase())
+  const files = fs
+    .readdirSync(folderPath)
+    .filter((f) =>
+      ['.png', '.jpg', '.jpeg'].includes(path.extname(f).toLowerCase()),
+    );
+
+  console.log(
+    `Found ${files.length} images. Results saved per-image to ${csvPath}`,
   );
 
-  console.log(`Found ${files.length} images. Results saved per-image to ${csvPath}`);
-
-  let allResults: any[] = [];
+  const allResults: ProcessedTransaction[] = [];
 
   for (const file of files) {
     const filePath = path.join(folderPath, file);
     try {
       const transactions = await extractDataFromImage(filePath);
       console.log(`    Extracted ${transactions.length} rows`);
-      
+
       for (const txn of transactions) {
         const processed = await processTransaction(condoName, txn);
         if (processed) {
           allResults.push(processed);
           // Insert to DB immediately
           const { error } = await supabase
-            .from('condo_sale_transactions')
-            .upsert(processed, { 
-              onConflict: 'condo_name_lower,sale_price,sale_month,exact_level,exact_unit',
-              ignoreDuplicates: false // We want to update existing rows with precise level/unit if they were URA rows
+            .from('sale_transactions')
+            .upsert(processed, {
+              onConflict:
+                'condo_name_lower,sale_price,sale_month,exact_level,exact_unit',
+              ignoreDuplicates: false, // We want to update existing rows with precise level/unit if they were URA rows
             });
-          if (error) console.log(`    DB Skip/Error: ${processed.exact_level}-${processed.exact_unit} | ${error.message}`);
+          if (error) {
+            console.log(
+              `    DB Skip/Error: ${processed.exact_level}-${processed.exact_unit} | ${error.message}`,
+            );
+          }
         }
       }
 
       // Update CSV after every image
       const csvData = stringify(allResults, { header: true });
       fs.writeFileSync(csvPath, csvData);
-      console.log(`    [Progress] CSV updated. Total rows: ${allResults.length}`);
-
+      console.log(
+        `    [Progress] CSV updated. Total rows: ${allResults.length}`,
+      );
     } catch (err) {
       console.error(`Error processing ${file}:`, err);
     }
@@ -192,4 +250,4 @@ async function main() {
   console.log('\nAll done! Final CSV at:', csvPath);
 }
 
-main();
+void main();

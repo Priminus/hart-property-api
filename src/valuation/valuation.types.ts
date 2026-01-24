@@ -1,6 +1,6 @@
 export type ValuationRequest = {
   condo_name: string;
-  unit_number: string; // e.g. "12-05" (floor-unit)
+  unit_number?: string; // e.g. "12-05" (floor-unit) - optional for landed properties
   sqft: number; // unit size in sqft
   email: string;
   name?: string;
