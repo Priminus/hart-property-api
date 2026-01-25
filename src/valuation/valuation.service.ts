@@ -43,7 +43,11 @@ export class ValuationService {
   /**
    * Get floor range string from floor number
    */
-  private getFloorRange(floor: number): { low: number; high: number; label: string } {
+  private getFloorRange(floor: number): {
+    low: number;
+    high: number;
+    label: string;
+  } {
     if (floor <= 5) return { low: 1, high: 5, label: '01 to 05' };
     if (floor <= 10) return { low: 6, high: 10, label: '06 to 10' };
     if (floor <= 15) return { low: 11, high: 15, label: '11 to 15' };
@@ -57,9 +61,18 @@ export class ValuationService {
 
   /**
    * Format floor range for display (e.g., "01 to 05")
+   * If exact_level is provided, use that instead of showing "?"
    */
-  private formatFloorRange(low: number | null, high: number | null): string {
-    if (low === null && high === null) return '?';
+  private formatFloorRange(
+    low: number | null,
+    high: number | null,
+    exactLevel?: number | null,
+  ): string {
+    // If we have exact_level, show that
+    if (exactLevel !== null && exactLevel !== undefined) {
+      return String(exactLevel).padStart(2, '0');
+    }
+    if (low === null && high === null) return '-';
     if (low === high) return String(low).padStart(2, '0');
     const l = low !== null ? String(low).padStart(2, '0') : '?';
     const h = high !== null ? String(high).padStart(2, '0') : '?';
@@ -142,6 +155,151 @@ export class ValuationService {
   }
 
   /**
+   * Calculate condo-wide YoY appreciation rate from ALL transactions (all unit types)
+   * Uses PSF to normalize across different unit sizes
+   */
+  private async calculateCondoWideYoYRate(
+    condoName: string,
+  ): Promise<{ rate: number; dataPoints: number }> {
+    const fiveYearsAgo = new Date();
+    fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
+    const minSaleMonth =
+      fiveYearsAgo.getFullYear() * 100 + (fiveYearsAgo.getMonth() + 1);
+
+    const { data } = await this.supabase
+      .from('sale_transactions')
+      .select('sale_price, sale_date, sqft')
+      .ilike('condo_name', condoName)
+      .gte('sale_month', minSaleMonth)
+      .not('sale_price', 'is', null)
+      .not('sqft', 'is', null)
+      .order('sale_date', { ascending: false });
+
+    if (!data || data.length < 2) {
+      return { rate: 0.03, dataPoints: data?.length || 0 }; // Default 3% if no data
+    }
+
+    // Group transactions by year and calculate average PSF per year
+    const yearlyPsf: Record<number, { total: number; count: number }> = {};
+    for (const t of data) {
+      const saleDate = new Date(t.sale_date as string);
+      const year = saleDate.getFullYear();
+      const psf = (t.sale_price as number) / (t.sqft as number);
+      if (!yearlyPsf[year]) {
+        yearlyPsf[year] = { total: 0, count: 0 };
+      }
+      yearlyPsf[year].total += psf;
+      yearlyPsf[year].count++;
+    }
+
+    // Calculate year-over-year changes
+    const years = Object.keys(yearlyPsf)
+      .map(Number)
+      .sort((a, b) => a - b);
+    if (years.length < 2) {
+      return { rate: 0.03, dataPoints: data.length };
+    }
+
+    let totalYoYChange = 0;
+    let yoyCount = 0;
+    for (let i = 1; i < years.length; i++) {
+      const prevYear = years[i - 1];
+      const currYear = years[i];
+      const prevAvgPsf = yearlyPsf[prevYear].total / yearlyPsf[prevYear].count;
+      const currAvgPsf = yearlyPsf[currYear].total / yearlyPsf[currYear].count;
+      const yoyChange = (currAvgPsf - prevAvgPsf) / prevAvgPsf;
+      totalYoYChange += yoyChange;
+      yoyCount++;
+    }
+
+    const avgYoYRate = yoyCount > 0 ? totalYoYChange / yoyCount : 0.03;
+
+    // Clamp to reasonable range (-15% to +20%)
+    const clampedRate = Math.max(-0.15, Math.min(0.2, avgYoYRate));
+
+    console.log('[Valuation] Condo-wide YoY rate:', {
+      condoName,
+      dataPoints: data.length,
+      yearsOfData: years.length,
+      avgYoYRate: (clampedRate * 100).toFixed(2) + '%',
+    });
+
+    return { rate: clampedRate, dataPoints: data.length };
+  }
+
+  /**
+   * Get the most recent transaction for a specific unit type (by sqft range)
+   */
+  private async getLatestUnitTypeTransaction(
+    condoName: string,
+    sqftLow: number,
+    sqftHigh: number,
+    floor: number,
+  ): Promise<{
+    sale_price: number;
+    sale_date: string;
+    sqft: number;
+    level_low: number | null;
+    level_high: number | null;
+    exact_level: number | null;
+  } | null> {
+    // First try to get a transaction on a similar floor
+    const floorRange = this.getFloorRange(floor);
+
+    const { data: sameFloorTxn } = await this.supabase
+      .from('sale_transactions')
+      .select('sale_price, sale_date, sqft, level_low, level_high, exact_level')
+      .ilike('condo_name', condoName)
+      .gte('sqft', sqftLow)
+      .lte('sqft', sqftHigh)
+      .not('sale_price', 'is', null)
+      .not('sqft', 'is', null)
+      .or(
+        `exact_level.gte.${floorRange.low},exact_level.lte.${floorRange.high},and(level_low.lte.${floorRange.high},level_high.gte.${floorRange.low})`,
+      )
+      .order('sale_date', { ascending: false })
+      .limit(1);
+
+    if (sameFloorTxn && sameFloorTxn.length > 0) {
+      const t = sameFloorTxn[0];
+      return {
+        sale_price: t.sale_price as number,
+        sale_date: t.sale_date as string,
+        sqft: t.sqft as number,
+        level_low: t.level_low as number | null,
+        level_high: t.level_high as number | null,
+        exact_level: t.exact_level as number | null,
+      };
+    }
+
+    // Fallback to any transaction in the sqft range
+    const { data: anyTxn } = await this.supabase
+      .from('sale_transactions')
+      .select('sale_price, sale_date, sqft, level_low, level_high, exact_level')
+      .ilike('condo_name', condoName)
+      .gte('sqft', sqftLow)
+      .lte('sqft', sqftHigh)
+      .not('sale_price', 'is', null)
+      .not('sqft', 'is', null)
+      .order('sale_date', { ascending: false })
+      .limit(1);
+
+    if (anyTxn && anyTxn.length > 0) {
+      const t = anyTxn[0];
+      return {
+        sale_price: t.sale_price as number,
+        sale_date: t.sale_date as string,
+        sqft: t.sqft as number,
+        level_low: t.level_low as number | null,
+        level_high: t.level_high as number | null,
+        exact_level: t.exact_level as number | null,
+      };
+    }
+
+    return null;
+  }
+
+  /**
    * Determine unit type and its sqft range from input sqft
    */
   private async getUnitTypeRange(
@@ -216,9 +374,11 @@ export class ValuationService {
     const minSaleMonth =
       twoYearsAgo.getFullYear() * 100 + (twoYearsAgo.getMonth() + 1);
 
-    const { data: recentUnitTypeTxns, error: recentError } = await this.supabase
+    const { data: recentUnitTypeTxns } = await this.supabase
       .from('sale_transactions')
-      .select('sale_price, sale_date, level_low, level_high, sqft, unit_type')
+      .select(
+        'sale_price, sale_date, level_low, level_high, exact_level, sqft, unit_type',
+      )
       .ilike('condo_name', condoName)
       .gte('sale_month', minSaleMonth)
       .gte('sqft', sqftLow)
@@ -227,14 +387,22 @@ export class ValuationService {
       .not('sqft', 'is', null)
       .order('sale_date', { ascending: false });
 
-    // Filter recent to same floor range
-    const recentSameFloor = (recentUnitTypeTxns || []).filter(
-      (t) =>
+    // Filter recent to same floor range (check exact_level OR level_low/level_high)
+    const recentSameFloor = (recentUnitTypeTxns || []).filter((t) => {
+      // If exact_level exists, check if it's within the floor range
+      if (t.exact_level !== null) {
+        return (
+          t.exact_level >= floorRange.low && t.exact_level <= floorRange.high
+        );
+      }
+      // Otherwise check level_low/level_high
+      return (
         t.level_low !== null &&
         t.level_high !== null &&
         t.level_low <= floorRange.high &&
-        t.level_high >= floorRange.low,
-    );
+        t.level_high >= floorRange.low
+      );
+    });
 
     // Step 3: If we have enough recent same-floor data (≥3), use it
     // Otherwise, fall back to older data
@@ -262,38 +430,101 @@ export class ValuationService {
         })),
       );
     } else {
-      // Fall back to all-time data
-      const { data: allTimeTxns } = await this.supabase
-        .from('sale_transactions')
-        .select('sale_price, sale_date, level_low, level_high, sqft, unit_type')
-        .ilike('condo_name', condoName)
-        .gte('sqft', sqftLow)
-        .lte('sqft', sqftHigh)
-        .not('sale_price', 'is', null)
-        .not('sqft', 'is', null)
-        .order('sale_date', { ascending: false });
+      // Smart fallback: Use condo-wide YoY rate applied to latest unit type transaction
+      console.log(
+        '[Valuation] Insufficient recent data, using YoY projection',
+        {
+          condoName,
+          recentSameFloor: recentSameFloor.length,
+          recentUnitType: (recentUnitTypeTxns || []).length,
+        },
+      );
 
-      if (!allTimeTxns || allTimeTxns.length === 0) {
+      // Get condo-wide YoY appreciation rate from ALL transactions
+      const { rate: condoYoYRate, dataPoints } =
+        await this.calculateCondoWideYoYRate(condoName);
+
+      // Get the latest transaction for this specific unit type
+      const latestTxn = await this.getLatestUnitTypeTransaction(
+        condoName,
+        sqftLow,
+        sqftHigh,
+        floor,
+      );
+
+      if (!latestTxn || dataPoints < 3) {
+        console.log(
+          '[Valuation] Cannot project - no latest transaction or insufficient condo data',
+        );
         return null;
       }
 
-      // Prefer same-floor even if old
-      const sameFloorAllTime = allTimeTxns.filter(
-        (t) =>
-          t.level_low !== null &&
-          t.level_high !== null &&
-          t.level_low <= floorRange.high &&
-          t.level_high >= floorRange.low,
+      // Calculate years since the latest transaction
+      const latestDate = new Date(latestTxn.sale_date);
+      const yearsSince = this.monthsDiff(latestDate, today) / 12;
+
+      // Project PSF using the condo-wide YoY rate
+      const latestPsf = latestTxn.sale_price / latestTxn.sqft;
+      const projectedPsf = latestPsf * Math.pow(1 + condoYoYRate, yearsSince);
+
+      // Apply floor adjustment if the transaction was on a different floor
+      const txnFloor =
+        latestTxn.exact_level ??
+        ((latestTxn.level_low ?? 10) + (latestTxn.level_high ?? 10)) / 2;
+      const floorDiff = floor - txnFloor;
+      const floorAdjustment = 1 + floorDiff * 0.005; // ~0.5% per floor
+      const floorAdjustedPsf = projectedPsf * floorAdjustment;
+
+      // Calculate price range (±5% for low/high since we're projecting)
+      const estimatedPsfMidProjected = Math.round(floorAdjustedPsf);
+      const estimatedPsfLowProjected = Math.round(floorAdjustedPsf * 0.95);
+      const estimatedPsfHighProjected = Math.round(floorAdjustedPsf * 1.05);
+
+      const estimatedPriceLow = Math.round(estimatedPsfLowProjected * unitSqft);
+      const estimatedPriceMid = Math.round(estimatedPsfMidProjected * unitSqft);
+      const estimatedPriceHigh = Math.round(
+        estimatedPsfHighProjected * unitSqft,
       );
 
-      allMatchingTxns = sameFloorAllTime.length >= 1 ? sameFloorAllTime : allTimeTxns;
-      appreciationRate = this.calculateAppreciationRate(
-        allTimeTxns.map((t) => ({
-          sale_price: t.sale_price as number,
-          sale_date: t.sale_date as string,
-          sqft: t.sqft as number,
-        })),
-      );
+      console.log('[Valuation] YoY projection result:', {
+        latestSaleDate: latestTxn.sale_date,
+        latestPsf: Math.round(latestPsf),
+        yearsSince: yearsSince.toFixed(2),
+        condoYoYRate: (condoYoYRate * 100).toFixed(2) + '%',
+        projectedPsf: Math.round(floorAdjustedPsf),
+      });
+
+      // Return the projected valuation with the latest transaction as reference
+      return {
+        condo_name: condoName,
+        unit_number: unitNumber,
+        unit_sqft: unitSqft,
+        estimated_floor: floor,
+        floor_range: floorRange.label,
+        appreciation_rate: condoYoYRate,
+        estimated_psf_low: estimatedPsfLowProjected,
+        estimated_psf_mid: estimatedPsfMidProjected,
+        estimated_psf_high: estimatedPsfHighProjected,
+        estimated_price_low: estimatedPriceLow,
+        estimated_price_mid: estimatedPriceMid,
+        estimated_price_high: estimatedPriceHigh,
+        recent_transactions: [
+          {
+            sale_price: latestTxn.sale_price,
+            sale_date: latestTxn.sale_date,
+            floor_range: this.formatFloorRange(
+              latestTxn.level_low,
+              latestTxn.level_high,
+              latestTxn.exact_level,
+            ),
+            sqft: latestTxn.sqft,
+            psf: Math.round(latestPsf),
+            adjusted_psf: Math.round(floorAdjustedPsf),
+          },
+        ],
+        data_period: `${latestTxn.sale_date} (projected using ${(condoYoYRate * 100).toFixed(1)}% YoY)`,
+        generated_at: new Date().toISOString(),
+      };
     }
 
     if (!allMatchingTxns || allMatchingTxns.length === 0) {
@@ -314,14 +545,16 @@ export class ValuationService {
 
     if (recentOnlyTxns.length >= 3) {
       // Enough recent data - use only recent transactions with weighted average
-      const recentPsfs: { psf: number; weight: number }[] = recentOnlyTxns.map((t) => {
-        const saleDate = new Date(t.sale_date as string);
-        const monthsAgo = this.monthsDiff(saleDate, today);
-        const rawPsf = (t.sale_price as number) / (t.sqft as number);
-        // Weight: exponential decay - recent transactions weighted more heavily
-        const weight = Math.pow(0.92, monthsAgo); // ~8% decay per month
-        return { psf: rawPsf, weight };
-      });
+      const recentPsfs: { psf: number; weight: number }[] = recentOnlyTxns.map(
+        (t) => {
+          const saleDate = new Date(t.sale_date as string);
+          const monthsAgo = this.monthsDiff(saleDate, today);
+          const rawPsf = (t.sale_price as number) / (t.sqft as number);
+          // Weight: exponential decay - recent transactions weighted more heavily
+          const weight = Math.pow(0.92, monthsAgo); // ~8% decay per month
+          return { psf: rawPsf, weight };
+        },
+      );
 
       // Weighted average
       let weightedSum = 0;
@@ -346,7 +579,7 @@ export class ValuationService {
           // Adjust older transactions forward using appreciation rate
           const adjustedPsf = rawPsf * Math.pow(1 + monthlyRate, monthsAgo);
           // Weight: heavier decay for older transactions
-          const weight = Math.pow(0.90, monthsAgo); // ~10% decay per month
+          const weight = Math.pow(0.9, monthsAgo); // ~10% decay per month
           return { psf: rawPsf, adjustedPsf, weight };
         });
 
@@ -368,7 +601,8 @@ export class ValuationService {
     }
 
     // Store which transactions we used for display
-    const finalTxns = recentOnlyTxns.length >= 3 ? recentOnlyTxns : allMatchingTxns;
+    const finalTxns =
+      recentOnlyTxns.length >= 3 ? recentOnlyTxns : allMatchingTxns;
 
     // Check if we're using same-floor data
     const usingSameFloor = finalTxns.some(
@@ -422,6 +656,7 @@ export class ValuationService {
         floor_range: this.formatFloorRange(
           t.level_low as number | null,
           t.level_high as number | null,
+          (t as { exact_level?: number | null }).exact_level,
         ),
         sqft,
         psf: rawPsf,
@@ -713,14 +948,23 @@ michael.hart@hartproperty.sg
     );
 
     // Store lead regardless of valuation result
-    await this.storeLead(email, req.name, condoName, unitNumber || '', valuation);
+    await this.storeLead(
+      email,
+      req.name,
+      condoName,
+      unitNumber || '',
+      valuation,
+    );
 
     if (!valuation) {
       // Still send a "we'll review" email if no data available
-      console.log('[Valuation] No data available, sending manual review notice', {
-        email,
-        condoName,
-      });
+      console.log(
+        '[Valuation] No data available, sending manual review notice',
+        {
+          email,
+          condoName,
+        },
+      );
       return {
         ok: true,
         message:
@@ -739,7 +983,7 @@ michael.hart@hartproperty.sg
     return {
       ok: true,
       message:
-        'Thank you! Your property valuation report will be sent to your email shortly.',
+        'Your property valuation report will be sent to your email shortly.',
     };
   }
 

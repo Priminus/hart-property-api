@@ -19,7 +19,7 @@ const openai = new OpenAI({
 interface ExtractedTransaction {
   date: string | null;
   level: number | null;
-  unit: string | null;
+  unit: number | null; // Integer unit number (e.g., 5 for #12-05)
   unit_type: string | null;
   property_type: string | null;
   sqft: number | null;
@@ -37,7 +37,7 @@ interface ProcessedTransaction {
   sqft: number | null;
   unit_type: string | null;
   exact_level: number | null;
-  exact_unit: string | null;
+  exact_unit: number | null; // Integer unit number
   type_of_sale: string | null;
   purchase_price: number | null;
   purchase_date: string | null;
@@ -69,17 +69,17 @@ Extract all table rows from the image.
 Return ONLY a JSON object with a key "transactions" containing an array of objects.
 Each object must have these keys:
 - date: string (the "Contract Date" or "Date of Sale", e.g., "23 Dec 2025")
-- level: number (integer from the "Level" column)
-- unit: string (the "Unit" number column, e.g., "12" or "05")
-- unit_type: string (e.g., "2BR", "3BR", or null)
-- property_type: string (e.g., "Condominium", "Apartment", "Terrace", etc. from "Property Type" or context)
+- level: number (integer - the FLOOR number, e.g., for "#12-05" the level is 12)
+- unit: number (integer - the UNIT number AFTER the dash, e.g., for "#12-05" the unit is 5, NOT "05")
+- unit_type: string (e.g., "2BR", "3BR", or null if not shown)
+- property_type: null (ALWAYS return null - we get this from URA data, DO NOT guess or infer)
 - sqft: number (integer from "Area (sqft)" column)
 - price: number (integer from "Price" or "Sale (Price)" column, remove currency and commas)
-- sale_type: string ("New Sale", "Resale", or "Sub Sale" from "Sale Type" column)
+- sale_type: string ("New Sale", "Resale", or "Sub Sale" from "Sale Type" column, or null if not shown)
 
 IMPORTANT: The "Street Name" column (e.g., "14 Adis Road") is NOT the level or unit. 
-The "Level" and "Unit" columns are separate numeric columns. 
-Ignore the street name.`,
+IMPORTANT: level is the FLOOR (first number), unit is the UNIT NUMBER (second number after dash). Return as integers, not strings.
+IMPORTANT: property_type must ALWAYS be null - never guess or infer it!`,
       },
       {
         role: 'user',
@@ -113,9 +113,62 @@ Ignore the street name.`,
 
 function parseDate(dateStr: string | null): string | null {
   if (!dateStr) return null;
-  const d = new Date(dateStr.trim());
-  if (isNaN(d.getTime())) return null;
-  return d.toISOString().split('T')[0];
+  const str = dateStr.trim();
+
+  // Try format: "23 Dec 2025" or "23 December 2025"
+  const monthNames: Record<string, string> = {
+    jan: '01',
+    january: '01',
+    feb: '02',
+    february: '02',
+    mar: '03',
+    march: '03',
+    apr: '04',
+    april: '04',
+    may: '05',
+    jun: '06',
+    june: '06',
+    jul: '07',
+    july: '07',
+    aug: '08',
+    august: '08',
+    sep: '09',
+    september: '09',
+    oct: '10',
+    october: '10',
+    nov: '11',
+    november: '11',
+    dec: '12',
+    december: '12',
+  };
+
+  // Match "DD Mon YYYY" or "DD Month YYYY"
+  const match = str.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/);
+  if (match) {
+    const day = match[1].padStart(2, '0');
+    const monthKey = match[2].toLowerCase();
+    const month = monthNames[monthKey];
+    const year = match[3];
+    if (month) {
+      return `${year}-${month}-${day}`;
+    }
+  }
+
+  // Try format: "YYYY-MM-DD" (already correct)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+    return str;
+  }
+
+  // Try format: "DD/MM/YYYY"
+  const slashMatch = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (slashMatch) {
+    const day = slashMatch[1].padStart(2, '0');
+    const month = slashMatch[2].padStart(2, '0');
+    const year = slashMatch[3];
+    return `${year}-${month}-${day}`;
+  }
+
+  return null;
 }
 
 async function processTransaction(
@@ -220,14 +273,20 @@ async function main() {
         const processed = await processTransaction(condoName, txn);
         if (processed) {
           allResults.push(processed);
-          // Insert to DB immediately
-          const { error } = await supabase
-            .from('sale_transactions')
-            .upsert(processed, {
-              onConflict:
-                'condo_name_lower,sale_price,sale_month,exact_level,exact_unit',
-              ignoreDuplicates: false, // We want to update existing rows with precise level/unit if they were URA rows
-            });
+          // Insert to DB - use RPC to preserve existing purchase_price/purchase_date
+          const { error } = await supabase.rpc('upsert_ocr_transaction', {
+            p_condo_name: processed.condo_name,
+            p_condo_name_lower: processed.condo_name_lower,
+            p_sale_date: processed.sale_date,
+            p_sale_price: processed.sale_price,
+            p_sale_month: processed.sale_month,
+            p_sqft: processed.sqft,
+            p_unit_type: processed.unit_type,
+            p_exact_level: processed.exact_level,
+            p_exact_unit: processed.exact_unit,
+            p_type_of_sale: processed.type_of_sale,
+            p_property_type: processed.property_type,
+          });
           if (error) {
             console.log(
               `    DB Skip/Error: ${processed.exact_level}-${processed.exact_unit} | ${error.message}`,
