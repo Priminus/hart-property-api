@@ -37,7 +37,7 @@ export class ReportsService {
     const { data, error } = await this.supabase
       .from('sale_transactions')
       .select(
-        'condo_name, purchase_price, profit, annualised_pct, purchase_date, sale_date, sale_price',
+        'condo_name, purchase_price, sale_price, annualised_pct, purchase_date, sale_date',
       )
       .eq('condo_name', condoName);
 
@@ -45,11 +45,10 @@ export class ReportsService {
     const rows = (data ?? []) as Array<{
       condo_name: string;
       purchase_price: unknown;
-      profit: unknown;
+      sale_price: unknown;
       annualised_pct: unknown;
       purchase_date: unknown;
       sale_date: unknown;
-      sale_price: unknown;
     }>;
 
     const profitabilityPcts: number[] = [];
@@ -58,12 +57,17 @@ export class ReportsService {
     for (const r of rows) {
       const purchasePrice =
         r.purchase_price == null ? NaN : Number(r.purchase_price);
-      const profit = r.profit == null ? NaN : Number(r.profit);
+      const salePrice = r.sale_price == null ? NaN : Number(r.sale_price);
       const annualised =
         r.annualised_pct == null ? NaN : Number(r.annualised_pct);
 
-      if (Number.isFinite(purchasePrice) && purchasePrice > 0 && Number.isFinite(profit)) {
-        profitabilityPcts.push((profit / purchasePrice) * 100);
+      if (
+        Number.isFinite(purchasePrice) &&
+        purchasePrice > 0 &&
+        Number.isFinite(salePrice) &&
+        salePrice > 0
+      ) {
+        profitabilityPcts.push(((salePrice - purchasePrice) / purchasePrice) * 100);
       }
 
       if (Number.isFinite(annualised)) {
@@ -121,19 +125,29 @@ export class ReportsService {
 
     if (!condos.length) return { ok: false, error: 'Missing condos parameter.' };
 
-    const { data, error } = await this.supabase
-      .from('sale_transactions')
-      .select('condo_name, purchase_price, profit, sale_date')
-      .in('condo_name', condos);
-
-    if (error) return { ok: false, error: error.message };
-
-    const rows = (data ?? []) as Array<{
+    const rows: Array<{
       condo_name: unknown;
       purchase_price: unknown;
-      profit: unknown;
+      sale_price: unknown;
       sale_date: unknown;
-    }>;
+    }> = [];
+    const PAGE_SIZE = 1000;
+    for (let offset = 0; ; offset += PAGE_SIZE) {
+      const { data, error } = await this.supabase
+        .from('sale_transactions')
+        .select('condo_name, purchase_price, sale_price, sale_date')
+        .in('condo_name', condos)
+        .range(offset, offset + PAGE_SIZE - 1);
+      if (error) return { ok: false, error: error.message };
+      const batch = (data ?? []) as Array<{
+        condo_name: unknown;
+        purchase_price: unknown;
+        sale_price: unknown;
+        sale_date: unknown;
+      }>;
+      rows.push(...batch);
+      if (batch.length < PAGE_SIZE) break;
+    }
 
     // condo -> year -> profit%[]
     const bucket = new Map<string, Map<number, number[]>>();
@@ -145,7 +159,7 @@ export class ReportsService {
 
       const purchasePrice =
         r.purchase_price == null ? NaN : Number(r.purchase_price);
-      const profit = r.profit == null ? NaN : Number(r.profit);
+      const salePrice = r.sale_price == null ? NaN : Number(r.sale_price);
 
       const saleDate =
         typeof r.sale_date === 'string' ? new Date(r.sale_date) : null;
@@ -156,12 +170,13 @@ export class ReportsService {
         saleYear === null ||
         !Number.isFinite(purchasePrice) ||
         purchasePrice <= 0 ||
-        !Number.isFinite(profit)
+        !Number.isFinite(salePrice) ||
+        salePrice <= 0
       ) {
         continue;
       }
 
-      const pct = (profit / purchasePrice) * 100;
+      const pct = ((salePrice - purchasePrice) / purchasePrice) * 100;
       yearSet.add(saleYear);
 
       if (!bucket.has(condoName)) bucket.set(condoName, new Map());
@@ -200,20 +215,31 @@ export class ReportsService {
 
     if (!condos.length) return { ok: false, error: 'Missing condos parameter.' };
 
-    const { data, error } = await this.supabase
-      .from('sale_transactions')
-      .select('condo_name, unit_type, purchase_price, profit, sale_date')
-      .in('condo_name', condos);
-
-    if (error) return { ok: false, error: error.message };
-
-    const rows = (data ?? []) as Array<{
+    const rows: Array<{
       condo_name: unknown;
       unit_type: unknown;
       purchase_price: unknown;
-      profit: unknown;
+      sale_price: unknown;
       sale_date: unknown;
-    }>;
+    }> = [];
+    const PAGE_SIZE = 1000;
+    for (let offset = 0; ; offset += PAGE_SIZE) {
+      const { data, error } = await this.supabase
+        .from('sale_transactions')
+        .select('condo_name, unit_type, purchase_price, sale_price, sale_date')
+        .in('condo_name', condos)
+        .range(offset, offset + PAGE_SIZE - 1);
+      if (error) return { ok: false, error: error.message };
+      const batch = (data ?? []) as Array<{
+        condo_name: unknown;
+        unit_type: unknown;
+        purchase_price: unknown;
+        sale_price: unknown;
+        sale_date: unknown;
+      }>;
+      rows.push(...batch);
+      if (batch.length < PAGE_SIZE) break;
+    }
 
     const out: Array<{
       condo_name: string;
@@ -229,7 +255,7 @@ export class ReportsService {
       const unitType = typeof r.unit_type === 'string' ? r.unit_type : null;
       const purchasePrice =
         r.purchase_price == null ? NaN : Number(r.purchase_price);
-      const profit = r.profit == null ? NaN : Number(r.profit);
+      const salePrice = r.sale_price == null ? NaN : Number(r.sale_price);
 
       const saleDate =
         typeof r.sale_date === 'string' ? new Date(r.sale_date) : null;
@@ -242,7 +268,8 @@ export class ReportsService {
         saleMonth === null ||
         !Number.isFinite(purchasePrice) ||
         purchasePrice <= 0 ||
-        !Number.isFinite(profit)
+        !Number.isFinite(salePrice) ||
+        salePrice <= 0
       ) {
         continue;
       }
@@ -251,7 +278,7 @@ export class ReportsService {
         condo_name: condoName,
         unit_type: unitType,
         sale_month: saleMonth,
-        profitability_pct: (profit / purchasePrice) * 100,
+        profitability_pct: ((salePrice - purchasePrice) / purchasePrice) * 100,
       });
     }
 

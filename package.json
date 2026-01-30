@@ -18,6 +18,7 @@
     "ingest:listings": "ts-node -r tsconfig-paths/register scripts/ingest-listings.ts",
     "ingest:ura": "ts-node -r tsconfig-paths/register scripts/ingest-ura-transactions.ts",
     "ingest:ocr": "ts-node -r tsconfig-paths/register scripts/ocr-import.ts",
+    "ingest:propnex-sales": "ts-node -r tsconfig-paths/register scripts/ingest-propnex-sales.ts",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
